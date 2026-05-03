@@ -1,4 +1,9 @@
 import { createServer } from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+loadDotEnv();
 
 const PORT = Number(process.env.PORT || 8788);
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
@@ -39,6 +44,22 @@ const server = createServer(async (req, res) => {
     return json(res, 500, { error: "internal_error", message: error.message || "AI 代理内部错误" });
   }
 });
+
+function loadDotEnv() {
+  const root = dirname(dirname(fileURLToPath(import.meta.url)));
+  const envPath = join(root, ".env");
+  if (!existsSync(envPath)) return;
+  const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    const [, key, rawValue] = match;
+    if (process.env[key] !== undefined) continue;
+    process.env[key] = rawValue.replace(/^['"]|['"]$/g, "");
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`DeepSeek AI proxy listening on http://localhost:${PORT}`);

@@ -20,10 +20,25 @@ python3 -m http.server 5173
 DEEPSEEK_API_KEY=你的key PORT=8788 node ai-proxy/index.mjs
 ```
 
+也可以在本目录创建一个不会提交的 `.env`：
+
+```bash
+DEEPSEEK_API_KEY=你的key
+DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+PORT=8788
+```
+
+然后直接运行：
+
+```bash
+node ai-proxy/index.mjs
+```
+
 可选环境变量：
 
 - `DEEPSEEK_MODEL=deepseek-chat`
-- `DEEPSEEK_BASE_URL=https://api.deepseek.com`
+- `DEEPSEEK_BASE_URL=https://api.deepseek.com` 或 `https://api.deepseek.com/v1`
 
 功能：
 
