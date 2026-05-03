@@ -16,8 +16,10 @@ const DEFAULT_PDF = {
   fileName: "bluebook-n1-n5-grammar.pdf",
   publicUrl: "/public/materials/bluebooks/bluebook-n1-n5-grammar.pdf",
 };
-const PDFJS_MODULE = "/public/vendor/pdfjs/pdf.mjs";
-const PDFJS_WORKER = "/public/vendor/pdfjs/pdf.worker.mjs";
+const PDFJS_LOCAL_MODULE = "/public/vendor/pdfjs/pdf.mjs";
+const PDFJS_LOCAL_WORKER = "/public/vendor/pdfjs/pdf.worker.mjs";
+const PDFJS_CDN_MODULE = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs";
+const PDFJS_CDN_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.mjs";
 const PDF_INDEX_DB = "bluebook-ai-pdf-index-v1";
 const PDF_INDEX_META_KEY = "bluebook";
 const AI_PROXY_DEFAULT = "http://localhost:8788";
@@ -205,8 +207,14 @@ function bindGlobalActions() {
 
 async function getPdfJs() {
   if (!pdfjsLib) {
-    pdfjsLib = await import(PDFJS_MODULE);
-    pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER;
+    try {
+      pdfjsLib = await import(PDFJS_LOCAL_MODULE);
+      pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_LOCAL_WORKER;
+    } catch (error) {
+      console.warn("Local PDF.js is unavailable, falling back to CDN", error);
+      pdfjsLib = await import(PDFJS_CDN_MODULE);
+      pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_CDN_WORKER;
+    }
   }
   return pdfjsLib;
 }

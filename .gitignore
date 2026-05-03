@@ -4,6 +4,7 @@ public/materials/past-papers/**/*.mp3
 public/materials/past-papers/**/*.m4a
 public/materials/past-papers/**/*.zip
 public/data/vocab/
+public/vendor/pdfjs/*.mjs
 .env
 .DS_Store
 *.log

@@ -57,4 +57,4 @@ node ai-proxy/index.mjs
 - `*.pdf` 已加入 `.gitignore`，不会被提交。
 - 词汇计划只记录每日数量，不内置词单；请在你的背词 app 中完成。
 - 阅读/听力计划使用 MOJi Test 中的真题：N3 2010-2024，N2 2010-2025；应用只记录年份、级别和板块，并提供打开 MOJi Test 网页端的按钮，不保存真题正文或音频。
-- PDF 阅读和目录扫描使用本地 vendored `pdfjs-dist`，许可文件在 `public/vendor/pdfjs/`。
+- PDF 阅读和目录扫描优先使用本地 vendored `pdfjs-dist`；如果 GitHub 网页保存版没有上传大体积 vendor 文件，会自动回退到 jsDelivr CDN 的 `pdfjs-dist@4.10.38`。
