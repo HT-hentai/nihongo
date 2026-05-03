@@ -1,0 +1,13 @@
+{
+  "name": "bluebook-n2-agent-ai-study",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ai-proxy": "PORT=8788 node ai-proxy/index.mjs",
+    "check": "node --check src/main.js && node --check ai-proxy/index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

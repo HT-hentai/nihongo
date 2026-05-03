@@ -540,6 +540,7 @@ select:focus {
 .task-reading::before   { --task-stripe: var(--coral); }
 .task-listening::before { --task-stripe: var(--amber); }
 .task-mock::before      { --task-stripe: var(--bad); }
+.task-ai-review::before { --task-stripe: var(--amber); }
 
 .status-done {
   background: var(--s2);
@@ -587,6 +588,66 @@ select:focus {
   flex-wrap: wrap;
   gap: 6px;
   margin-top: 10px;
+}
+
+/* ── AI Quiz / Notebook ─────────────────────────────────────── */
+.quiz-box,
+.ai-reader-box,
+.ai-result {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--b1);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.quiz-question {
+  padding: 10px 0;
+  border-top: 1px solid var(--b1);
+}
+
+.quiz-question:first-of-type {
+  border-top: 0;
+}
+
+.quiz-question strong {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--t1);
+  line-height: 1.55;
+}
+
+.quiz-input {
+  width: 100%;
+  min-height: 36px;
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--b2);
+  border-radius: var(--r-sm);
+  background: var(--s2);
+  color: var(--t1);
+}
+
+textarea.quiz-input {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.quiz-feedback {
+  margin-top: 6px;
+  color: var(--ok);
+  font-size: 12.5px;
+}
+
+.quiz-feedback.bad {
+  color: var(--coral);
+}
+
+.quiz-question button.active {
+  background: var(--teal);
+  border-color: transparent;
+  color: #001a16;
 }
 
 /* ── Pills / Tags ───────────────────────────────────────────── */
@@ -821,6 +882,29 @@ select:focus {
   pointer-events: none;
 }
 
+.text-layer {
+  position: absolute;
+  inset: 20px;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: auto;
+  user-select: text;
+}
+
+.text-layer span {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  line-height: 1;
+  transform-origin: 0 0;
+  cursor: text;
+}
+
+.text-layer ::selection {
+  background: rgba(0, 209, 168, 0.32);
+  color: transparent;
+}
+
 .annotation-layer button {
   position: absolute;
   border: 0;
@@ -829,6 +913,22 @@ select:focus {
   padding: 0;
   border-radius: 3px;
   min-height: unset;
+}
+
+.selection-tools {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  background: rgba(17, 17, 22, 0.94);
+  border: 1px solid var(--b2);
+  border-radius: var(--r-sm);
+  box-shadow: var(--sh-md);
+}
+
+.selection-tools[hidden] {
+  display: none;
 }
 
 .annotation-layer button:hover {

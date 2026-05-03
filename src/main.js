@@ -1,5 +1,5 @@
 const STORAGE_KEY = "bluebook-n2-agent-state-v1";
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 const START_DATE = "2026-05-01";
 const END_DATE = "2026-07-04";
 const EXAM_DATE = "2026-07-05";
@@ -18,11 +18,15 @@ const DEFAULT_PDF = {
 };
 const PDFJS_MODULE = "/public/vendor/pdfjs/pdf.mjs";
 const PDFJS_WORKER = "/public/vendor/pdfjs/pdf.worker.mjs";
+const PDF_INDEX_DB = "bluebook-ai-pdf-index-v1";
+const PDF_INDEX_META_KEY = "bluebook";
+const AI_PROXY_DEFAULT = "http://localhost:8788";
 
 let pdfjsLib = null;
 let pdfDoc = null;
 let pdfRenderTask = null;
 let taskRegistry = new Map();
+let pdfIndexPromise = null;
 let app = {
   view: "today",
   selectedDate: clampDate(todayIso(), START_DATE, END_DATE),
@@ -30,6 +34,8 @@ let app = {
   readerTitle: "蓝宝书",
   catalogFilter: "N2",
   scanMessage: "",
+  readerSelection: null,
+  aiPanel: { status: "idle", message: "", result: null },
   state: loadState(),
 };
 
@@ -50,9 +56,18 @@ function defaultState() {
     catalog: [],
     statuses: {},
     notes: {},
+    pdfIndexMeta: null,
+    aiNotebook: [],
+    quizCache: {},
+    quizResults: {},
     settings: {
       dailyMinutes: 240,
       grammarRange: "auto",
+      ai: {
+        enabled: true,
+        proxyUrl: AI_PROXY_DEFAULT,
+        model: "deepseek-chat",
+      },
     },
   };
 }
@@ -60,12 +75,20 @@ function defaultState() {
 function loadState() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-    if (saved && saved.version === STATE_VERSION) {
+    if (saved && saved.version <= STATE_VERSION) {
       return {
         ...defaultState(),
         ...saved,
+        version: STATE_VERSION,
         pdf: { ...DEFAULT_PDF, ...(saved.pdf || {}) },
-        settings: { ...defaultState().settings, ...(saved.settings || {}) },
+        settings: {
+          ...defaultState().settings,
+          ...(saved.settings || {}),
+          ai: { ...defaultState().settings.ai, ...(saved.settings?.ai || {}) },
+        },
+        aiNotebook: saved.aiNotebook || [],
+        quizCache: saved.quizCache || {},
+        quizResults: saved.quizResults || {},
       };
     }
   } catch (error) {
@@ -131,6 +154,27 @@ function bindGlobalActions() {
     if (action === "reader-next") {
       openReader(Math.min((pdfDoc && pdfDoc.numPages) || 965, app.readerPage + 1), app.readerTitle);
     }
+    if (action === "build-pdf-index") {
+      buildPdfIndex(true);
+    }
+    if (action === "ai-explain-selection") {
+      explainReaderSelection(target.dataset.mode || "analyze");
+    }
+    if (action === "ai-save-selection") {
+      saveReaderSelection();
+    }
+    if (action === "generate-quiz") {
+      generateQuiz(target.dataset.taskId);
+    }
+    if (action === "answer-quiz-choice") {
+      answerQuizChoice(target.dataset.quizKey, target.dataset.questionId, target.dataset.value);
+    }
+    if (action === "check-quiz-blank") {
+      checkQuizBlank(target.dataset.quizKey, target.dataset.questionId);
+    }
+    if (action === "grade-quiz-sentence") {
+      gradeQuizSentence(target.dataset.quizKey, target.dataset.questionId);
+    }
   });
 
   document.addEventListener("change", (event) => {
@@ -150,6 +194,8 @@ function bindGlobalActions() {
       openReader(Number(target.value || 1), app.readerTitle);
     }
   });
+
+  document.addEventListener("mouseup", handleTextSelection);
 }
 
 async function getPdfJs() {
@@ -291,6 +337,7 @@ function render() {
           ${navButton("today", "今日计划")}
           ${navButton("calendar", "日历")}
           ${navButton("review", "积压池")}
+          ${navButton("notebook", "AI 生词本")}
           ${navButton("catalog", "目录校对")}
           ${navButton("reader", "PDF 阅读器")}
         </nav>
@@ -325,6 +372,7 @@ function navButton(view, label) {
 function renderView(plan) {
   if (app.view === "calendar") return renderCalendar(plan);
   if (app.view === "review") return renderReview(plan);
+  if (app.view === "notebook") return renderNotebook();
   if (app.view === "catalog") return renderCatalog();
   if (app.view === "reader") return renderReader();
   return renderToday(plan);
@@ -483,9 +531,11 @@ function renderTask(task) {
           </div>
           <div class="task-meta">${task.detail}</div>
           ${renderTaskItems(task)}
+          ${renderQuiz(task)}
         </div>
         <div class="task-actions">
           ${page ? `<button class="primary small" data-action="open-reader" data-page="${page}" data-title="${escapeAttr(task.label)}">打开 PDF</button>` : ""}
+          ${task.type === "grammar" && task.mode !== "review" ? `<button class="small" data-action="generate-quiz" data-task-id="${escapeAttr(task.id)}">生成小测</button>` : ""}
           ${task.externalUrl ? `<button class="primary small" data-action="open-external" data-url="${escapeAttr(task.externalUrl)}">${escapeAttr(task.externalLabel || "打开资料")}</button>` : ""}
         </div>
       </div>
@@ -514,15 +564,76 @@ function renderTaskItems(task) {
   if (task.type === "grammar") {
     return `<div class="task-items">${refsToEntries(task.entryRefs).slice(0, 12).map((entry) => `<span class="pill">${entry.number}. ${entry.title}</span>`).join("")}</div>`;
   }
+  if (task.type === "ai-review") {
+    return `<div class="task-items">${(task.reviewItems || []).slice(0, 12).map((item) => `<span class="pill">${escapeHtml(item.label)}</span>`).join("")}</div>`;
+  }
   if (task.items && task.items.length) {
     return `<div class="task-items">${task.items.slice(0, 18).map((item) => `<span class="pill">${item}</span>`).join("")}</div>`;
   }
   return "";
 }
 
+function renderQuiz(task) {
+  if (task.type !== "grammar" || task.mode === "review") return "";
+  const key = quizKeyForTask(task);
+  const quiz = app.state.quizCache[key];
+  const result = app.state.quizResults[key] || { answers: {}, checked: {} };
+  if (!quiz) return "";
+  if (quiz.status === "loading") return `<div class="quiz-box"><span class="pill warn">AI 小测</span><p>正在生成小测...</p></div>`;
+  if (quiz.status === "error") return `<div class="quiz-box"><span class="pill bad">AI 小测失败</span><p>${escapeHtml(quiz.message || "请确认 8788 AI 代理已启动。")}</p></div>`;
+  const questions = quiz.questions || [];
+  return `
+    <div class="quiz-box">
+      <div class="task-title">
+        <span class="pill info">AI 小测</span>
+        <h4>${escapeHtml(quiz.title || "蓝宝书文法小测")}</h4>
+        ${typeof result.score === "number" ? `<span class="pill ${result.score >= 70 ? "level" : "warn"}">${result.score} 分</span>` : ""}
+      </div>
+      ${questions.map((question, index) => renderQuizQuestion(key, question, index, result)).join("")}
+    </div>
+  `;
+}
+
+function renderQuizQuestion(quizKey, question, index, result) {
+  const answer = result.answers?.[question.id] || "";
+  const checked = result.checked?.[question.id];
+  const dom = domId(`${quizKey}-${question.id}`);
+  const feedback = checked ? `<p class="quiz-feedback ${checked.correct === false ? "bad" : ""}">${escapeHtml(checked.feedback || checked.explanation || "")}</p>` : "";
+  if (question.type === "choice") {
+    return `
+      <div class="quiz-question">
+        <strong>${index + 1}. ${escapeHtml(question.prompt)}</strong>
+        <div class="task-items">
+          ${(question.choices || []).map((choice) => `<button class="small ${answer === choice ? "active" : ""}" data-action="answer-quiz-choice" data-quiz-key="${escapeAttr(quizKey)}" data-question-id="${escapeAttr(question.id)}" data-value="${escapeAttr(choice)}">${escapeHtml(choice)}</button>`).join("")}
+        </div>
+        ${feedback}
+      </div>
+    `;
+  }
+  if (question.type === "sentence") {
+    return `
+      <div class="quiz-question">
+        <strong>${index + 1}. ${escapeHtml(question.prompt)}</strong>
+        <textarea id="${dom}" class="quiz-input" placeholder="写一句日语句子">${escapeHtml(answer)}</textarea>
+        <button class="small" data-action="grade-quiz-sentence" data-quiz-key="${escapeAttr(quizKey)}" data-question-id="${escapeAttr(question.id)}">AI 批改</button>
+        ${feedback}
+      </div>
+    `;
+  }
+  return `
+    <div class="quiz-question">
+      <strong>${index + 1}. ${escapeHtml(question.prompt)}</strong>
+      <input id="${dom}" class="quiz-input" value="${escapeAttr(answer)}" placeholder="填写答案" />
+      <button class="small" data-action="check-quiz-blank" data-quiz-key="${escapeAttr(quizKey)}" data-question-id="${escapeAttr(question.id)}">检查</button>
+      ${feedback}
+    </div>
+  `;
+}
+
 function pillForTask(task) {
   if (task.mode === "carryover") return "warn";
   if (task.type === "grammar") return "level";
+  if (task.type === "ai-review") return "warn";
   if (task.type === "review") return "warn";
   if (task.type === "mock") return "bad";
   return "info";
@@ -594,6 +705,46 @@ function renderReview(plan) {
         </div>
       </div>
     </section>
+  `;
+}
+
+function renderNotebook() {
+  const items = app.state.aiNotebook || [];
+  const due = items.filter((item) => !item.archived && (!item.nextReviewDate || item.nextReviewDate <= todayIso())).length;
+  return `
+    <div class="topbar">
+      <div>
+        <h2>AI 生词本</h2>
+        <p>${items.length} 个收藏，${due} 个今天应复习。收藏不会写入 PDF，也不会导出 PDF 正文。</p>
+      </div>
+      <div class="toolbar">
+        <button data-action="nav" data-view="reader">去 PDF 选句</button>
+      </div>
+    </div>
+    <section class="panel">
+      <div class="panel-body">
+        <div class="task-list">
+          ${items.map(renderNotebookItem).join("") || `<div class="empty">还没有收藏。打开 PDF 阅读器，选中词或例句后点击收藏。</div>`}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderNotebookItem(item) {
+  return `
+    <article class="task task-ai-review">
+      <div class="task-main">
+        <div>
+          <div class="task-title">
+            <span class="pill warn">${item.type === "sentence" ? "例句" : item.type === "grammar" ? "语法" : "生词"}</span>
+            <h4>${escapeHtml(item.text)}</h4>
+          </div>
+          <div class="task-meta">${escapeHtml(item.meaning || item.reviewSuggestion || "待复习")} · 下次 ${item.nextReviewDate || "今天"} · 第 ${item.sourcePage || "?"} 页</div>
+          ${(item.grammarRefs || []).length ? `<div class="task-items">${item.grammarRefs.map((ref) => `<span class="pill">${escapeHtml(ref)}</span>`).join("")}</div>` : ""}
+        </div>
+      </div>
+    </article>
   `;
 }
 
@@ -683,18 +834,59 @@ function renderReader() {
         <div class="canvas-wrap">
           <iframe id="pdfFallback" class="pdf-fallback" src="${app.state.pdf.publicUrl}#page=${app.readerPage}" title="蓝宝书 PDF"></iframe>
           <canvas id="pdfCanvas" style="display:none;"></canvas>
+          <div id="textLayer" class="text-layer"></div>
           <div id="annotationLayer" class="annotation-layer"></div>
+          <div id="selectionTools" class="selection-tools" hidden></div>
         </div>
       </section>
       <aside class="panel">
         <div class="panel-head">
-          <h3>快速跳转</h3>
-          <p>按级别和条目打开 PDF。</p>
+          <h3>AI 阅读助手</h3>
+          <p>选中 PDF 里的词或例句后，可以解释、识别语法或收藏。</p>
         </div>
         <div class="panel-body">
+          ${renderReaderAiPanel()}
+          <div class="panel-head" style="padding: 14px 0 0;">
+            <h3>快速跳转</h3>
+            <p>按级别和条目打开 PDF。</p>
+          </div>
           ${LEVEL_ORDER.map((level) => quickJumpLevel(level)).join("")}
         </div>
       </aside>
+    </div>
+  `;
+}
+
+function renderReaderAiPanel() {
+  const meta = app.state.pdfIndexMeta;
+  const result = app.aiPanel.result;
+  return `
+    <div class="ai-reader-box">
+      <div class="task-items" style="margin-top:0;">
+        <span class="pill ${meta?.fingerprint ? "level" : "warn"}">${meta?.fingerprint ? "索引已建" : "索引未建"}</span>
+        <span class="pill">代理 ${app.state.settings.ai.proxyUrl}</span>
+      </div>
+      <p class="task-meta" id="pdfIndexStatus">${meta?.indexedAt ? `索引时间：${formatDateTime(meta.indexedAt)}` : "首次打开阅读器会在后台建立本机索引。"}</p>
+      <button class="small" data-action="build-pdf-index">重建索引</button>
+      ${app.aiPanel.status === "loading" ? `<div class="empty" style="margin-top:12px;">AI 正在分析选中文本...</div>` : ""}
+      ${app.aiPanel.message ? `<div class="empty" style="margin-top:12px;">${escapeHtml(app.aiPanel.message)}</div>` : ""}
+      ${result ? renderAiExplanation(result) : ""}
+    </div>
+  `;
+}
+
+function renderAiExplanation(result) {
+  const grammar = result.grammarPoints || [];
+  return `
+    <div class="ai-result">
+      <div class="task-title">
+        <span class="pill info">解释</span>
+        <h4>${escapeHtml(result.original || app.readerSelection?.text || "")}</h4>
+      </div>
+      <p>${escapeHtml(result.meaning || "")}</p>
+      ${result.reading ? `<p class="task-meta">读音：${escapeHtml(result.reading)}</p>` : ""}
+      ${grammar.length ? `<div class="task-items">${grammar.map((item) => `<span class="pill">${escapeHtml(item.level || "语法")} ${escapeHtml(item.name || "")}</span>`).join("")}</div>` : ""}
+      ${result.reviewSuggestion ? `<p class="task-meta">${escapeHtml(result.reviewSuggestion)}</p>` : ""}
     </div>
   `;
 }
@@ -752,7 +944,9 @@ async function renderPdfPage(pageNumber) {
     window.clearTimeout(fallbackTimer);
     canvas.style.display = "block";
     if (fallback) fallback.style.display = "none";
+    await renderTextLayer(page, viewport);
     await renderAnnotations(page, viewport, layer);
+    ensurePdfIndexStarted();
     const pageInput = document.querySelector("[data-reader-page]");
     if (pageInput) pageInput.value = pageNumber;
     const pageCount = document.querySelector("#pageCount");
@@ -764,6 +958,28 @@ async function renderPdfPage(pageNumber) {
     layer.innerHTML = "";
     if (fallback) fallback.style.display = "block";
     if (status) status.innerHTML = `PDF.js 渲染失败，已切换到后备阅读器`;
+  }
+}
+
+async function renderTextLayer(page, viewport) {
+  const layer = document.querySelector("#textLayer");
+  if (!layer) return;
+  layer.innerHTML = "";
+  layer.style.width = `${viewport.width}px`;
+  layer.style.height = `${viewport.height}px`;
+  const textContent = await page.getTextContent();
+  app.currentPageText = textContent.items.map((item) => item.str).join(" ").replace(/\s+/g, " ").trim();
+  const lib = await getPdfJs();
+  for (const item of textContent.items) {
+    if (!item.str || !item.str.trim()) continue;
+    const tx = lib.Util.transform(viewport.transform, item.transform);
+    const span = document.createElement("span");
+    span.textContent = item.str;
+    span.style.left = `${tx[4]}px`;
+    span.style.top = `${tx[5]}px`;
+    span.style.fontSize = `${Math.max(8, Math.hypot(tx[2], tx[3]))}px`;
+    span.style.transform = `scaleX(${Math.max(0.7, Math.min(1.4, (item.width || 1) / Math.max(1, item.str.length * Math.max(8, Math.hypot(tx[0], tx[1])) * 0.5)))})`;
+    layer.appendChild(span);
   }
 }
 
@@ -804,6 +1020,217 @@ function openReader(page, title) {
   app.readerTitle = title || "蓝宝书";
   app.view = "reader";
   render();
+}
+
+function handleTextSelection(event) {
+  const layer = event.target.closest?.("#textLayer");
+  if (!layer) return;
+  const selection = window.getSelection();
+  const text = selection ? selection.toString().trim() : "";
+  if (!text) return;
+  const rect = selection.getRangeAt(0).getBoundingClientRect();
+  app.readerSelection = {
+    text,
+    page: app.readerPage,
+    entryRef: currentEntryForPage(app.readerPage)?.id || "",
+  };
+  const tools = document.querySelector("#selectionTools");
+  if (!tools) return;
+  tools.hidden = false;
+  tools.style.left = `${Math.max(12, rect.left + window.scrollX - layer.getBoundingClientRect().left)}px`;
+  tools.style.top = `${Math.max(12, rect.top + window.scrollY - layer.getBoundingClientRect().top - 46)}px`;
+  tools.innerHTML = `
+    <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
+    <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
+    <button class="small" data-action="ai-save-selection">收藏</button>
+  `;
+}
+
+async function explainReaderSelection(mode) {
+  if (!app.readerSelection?.text) return;
+  app.aiPanel = { status: "loading", message: "", result: null };
+  render();
+  try {
+    const context = await collectReaderContext();
+    const payload = await aiFetch("/api/deepseek/explain", { mode, ...context });
+    app.aiPanel = { status: "done", message: "", result: payload.explanation };
+    saveState();
+    render();
+  } catch (error) {
+    app.aiPanel = { status: "error", message: error.message, result: null };
+    render();
+  }
+}
+
+async function saveReaderSelection() {
+  if (!app.readerSelection?.text) return;
+  const result = app.aiPanel.result || {};
+  const item = {
+    id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    type: guessNotebookType(app.readerSelection.text, result),
+    text: app.readerSelection.text,
+    reading: result.reading || "",
+    meaning: result.meaning || result.reviewSuggestion || "",
+    grammarRefs: uniqueRefs([app.readerSelection.entryRef, ...(result.grammarPoints || []).map((point) => point.name)].filter(Boolean)),
+    sourcePage: app.readerSelection.page,
+    sourceEntryRef: app.readerSelection.entryRef,
+    nextReviewDate: addDays(todayIso(), 1),
+    ease: 1,
+    lapses: 0,
+    createdAt: new Date().toISOString(),
+    reviewSuggestion: result.reviewSuggestion || "",
+  };
+  app.state.aiNotebook.unshift(item);
+  app.aiPanel.message = "已收藏，明天开始进入 AI 生词/例句复习。";
+  saveState();
+  render();
+}
+
+function guessNotebookType(text, result) {
+  if ((result.grammarPoints || []).length) return "grammar";
+  if (/[。！？]/.test(text) || text.length > 18) return "sentence";
+  return "word";
+}
+
+async function collectReaderContext() {
+  const selectedText = app.readerSelection?.text || "";
+  const currentEntry = currentEntryForPage(app.readerSelection?.page || app.readerPage);
+  const pageText = await getPageText(app.readerPage);
+  const before = app.readerPage > 1 ? await getPageText(app.readerPage - 1) : "";
+  const after = app.readerPage < (app.state.pdf.pages || 965) ? await getPageText(app.readerPage + 1) : "";
+  const entryContext = currentEntry ? await getEntryText(currentEntry) : pageText;
+  return {
+    selectedText,
+    currentEntry,
+    pageText,
+    nearbyContext: [before, after].filter(Boolean).join("\n"),
+    entryContext,
+  };
+}
+
+function currentEntryForPage(page) {
+  const entries = app.state.catalog
+    .filter((entry) => entry.page && entry.page <= page)
+    .sort((a, b) => b.page - a.page || LEVEL_ORDER.indexOf(b.level) - LEVEL_ORDER.indexOf(a.level));
+  return entries[0] || null;
+}
+
+function ensurePdfIndexStarted() {
+  if (app.state.pdfIndexMeta?.fingerprint || pdfIndexPromise) return;
+  pdfIndexPromise = buildPdfIndex(false).finally(() => {
+    pdfIndexPromise = null;
+  });
+}
+
+async function buildPdfIndex(force) {
+  const status = document.querySelector("#pdfIndexStatus");
+  const pdf = await getPdfDoc();
+  const fingerprint = `${app.state.pdf.fileName}:${pdf.numPages}:${app.state.catalog.length}`;
+  const db = await openPdfIndexDb();
+  const existing = await idbGet(db, "meta", PDF_INDEX_META_KEY);
+  if (!force && existing?.fingerprint === fingerprint) {
+    app.state.pdfIndexMeta = existing;
+    saveState();
+    return existing;
+  }
+  if (status) status.textContent = "正在抽取 PDF 全书文本索引...";
+  await idbClear(db, "pages");
+  await idbClear(db, "entries");
+
+  const pageTexts = new Map();
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    const extracted = await extractPageText(pdf, pageNumber);
+    pageTexts.set(pageNumber, extracted.text);
+    await idbPut(db, "pages", { page: pageNumber, ...extracted });
+    if (status && pageNumber % 10 === 0) status.textContent = `正在索引 PDF：${pageNumber}/${pdf.numPages} 页`;
+  }
+
+  const sorted = app.state.catalog.filter((entry) => entry.page).sort((a, b) => LEVEL_ORDER.indexOf(a.level) - LEVEL_ORDER.indexOf(b.level) || a.number - b.number);
+  for (let index = 0; index < sorted.length; index += 1) {
+    const entry = sorted[index];
+    const next = sorted.slice(index + 1).find((item) => item.level === entry.level && item.page);
+    const endPage = Math.max(entry.page, Math.min(next ? next.page - 1 : entry.page + 2, pdf.numPages));
+    const text = range(entry.page, endPage).map((page) => pageTexts.get(page) || "").join("\n");
+    await idbPut(db, "entries", { entryRef: entryRef(entry), startPage: entry.page, endPage, text });
+  }
+
+  const meta = { key: PDF_INDEX_META_KEY, fingerprint, pages: pdf.numPages, completedPages: pdf.numPages, indexedAt: new Date().toISOString() };
+  await idbPut(db, "meta", meta);
+  app.state.pdfIndexMeta = meta;
+  saveState();
+  if (status) status.textContent = `索引完成：${pdf.numPages} 页`;
+  render();
+  return meta;
+}
+
+async function extractPageText(pdf, pageNumber) {
+  const page = await pdf.getPage(pageNumber);
+  const textContent = await page.getTextContent();
+  const blocks = textContent.items
+    .filter((item) => item.str && item.str.trim())
+    .map((item) => ({ text: item.str, x: Math.round(item.transform[4]), y: Math.round(item.transform[5]) }));
+  return {
+    text: blocks.map((block) => block.text).join(" ").replace(/\s+/g, " ").trim(),
+    blocks,
+  };
+}
+
+async function getPageText(pageNumber) {
+  const db = await openPdfIndexDb();
+  const stored = await idbGet(db, "pages", pageNumber);
+  if (stored?.text) return stored.text;
+  if (pageNumber === app.readerPage && app.currentPageText) return app.currentPageText;
+  const pdf = await getPdfDoc();
+  const extracted = await extractPageText(pdf, pageNumber);
+  await idbPut(db, "pages", { page: pageNumber, ...extracted });
+  return extracted.text;
+}
+
+async function getEntryText(entry) {
+  const db = await openPdfIndexDb();
+  const stored = await idbGet(db, "entries", entryRef(entry));
+  if (stored?.text) return stored.text;
+  const pdf = await getPdfDoc();
+  const peers = app.state.catalog.filter((item) => item.level === entry.level && item.page && item.number > entry.number).sort((a, b) => a.number - b.number);
+  const endPage = Math.max(entry.page || app.readerPage, Math.min(peers[0]?.page ? peers[0].page - 1 : (entry.page || app.readerPage) + 2, pdf.numPages));
+  const pages = [];
+  for (let page = entry.page || app.readerPage; page <= endPage; page += 1) pages.push(await getPageText(page));
+  const text = pages.join("\n");
+  await idbPut(db, "entries", { entryRef: entryRef(entry), startPage: entry.page, endPage, text });
+  return text;
+}
+
+function openPdfIndexDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(PDF_INDEX_DB, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("pages")) db.createObjectStore("pages", { keyPath: "page" });
+      if (!db.objectStoreNames.contains("entries")) db.createObjectStore("entries", { keyPath: "entryRef" });
+      if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "key" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function idbGet(db, store, key) {
+  return idbRequest(db.transaction(store, "readonly").objectStore(store).get(key));
+}
+
+function idbPut(db, store, value) {
+  return idbRequest(db.transaction(store, "readwrite").objectStore(store).put(value));
+}
+
+function idbClear(db, store) {
+  return idbRequest(db.transaction(store, "readwrite").objectStore(store).clear());
+}
+
+function idbRequest(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
 }
 
 function buildPlan(catalog) {
@@ -868,6 +1295,7 @@ function baseTasksForDate(date, plan) {
   tasks.push(vocabTask(date, level, vocabCountForDate(date)));
   tasks.push(readingTask(date));
   tasks.push(listeningTask(date));
+  tasks.push(aiReviewTask(date));
   if (date >= "2026-06-21") {
     tasks.push(mockTask(date));
   }
@@ -1075,6 +1503,7 @@ function taskPriority(task, isRollover) {
   if (task.type === "grammar" && task.mode === "review") return 25;
   if (isRollover && (task.type === "reading" || task.type === "listening")) return 30;
   if (task.type === "reading" || task.type === "listening") return 40;
+  if (task.type === "ai-review") return 45;
   if (task.type === "vocab") return 50;
   if (task.type === "mock") return 60;
   return 70;
@@ -1149,6 +1578,41 @@ function listeningTask(date) {
     externalLabel: "打开 MOJi Test",
     items: ["MOJi Test", `${source.level} ${source.year}`, `听力 ${section}`, "第一遍答题", "第二遍错题重听"],
   };
+}
+
+function aiReviewTask(date) {
+  const reviewItems = dueAiReviewItems(date);
+  if (!reviewItems.length) return null;
+  return {
+    id: `ai-review-${date}-${hashRefs(reviewItems.map((item) => item.id))}`,
+    type: "ai-review",
+    kindLabel: "AI复习",
+    label: `AI 生词/例句复习：${reviewItems.length} 项`,
+    detail: "复习你从 PDF 里收藏的词句，以及低分小测对应的语法点；完成后会自动滚到下一次复习。",
+    estimatedMinutes: Math.min(25, Math.max(15, reviewItems.length * 3)),
+    reviewItems,
+    items: reviewItems.map((item) => item.label),
+  };
+}
+
+function dueAiReviewItems(date) {
+  const notebook = (app.state.aiNotebook || [])
+    .filter((item) => !item.archived && (!item.nextReviewDate || item.nextReviewDate <= date))
+    .map((item) => ({
+      id: `note:${item.id}`,
+      label: item.text,
+      source: "notebook",
+      itemId: item.id,
+    }));
+  const quizzes = Object.entries(app.state.quizResults || {})
+    .filter(([, result]) => result.completedAt && result.score < 70 && (!result.nextReviewDate || result.nextReviewDate <= date) && !result.reviewedAt)
+    .map(([key, result]) => ({
+      id: `quiz:${key}`,
+      label: `小测低分复盘 ${result.score} 分`,
+      source: "quiz",
+      itemId: key,
+    }));
+  return [...notebook, ...quizzes].slice(0, 10);
 }
 
 function mockTask(date) {
@@ -1305,6 +1769,9 @@ function setTaskStatus(taskId, status) {
       }
     }
   }
+  if (status === "done" && task?.type === "ai-review") {
+    completeAiReviewTask(task);
+  }
   saveState();
   render();
 }
@@ -1337,6 +1804,175 @@ function statusFor(task) {
 
 function statusForId(taskId, statuses) {
   return { status: "todo", confidence: null, ...((statuses || {})[taskId] || {}) };
+}
+
+function completeAiReviewTask(task) {
+  const today = todayIso();
+  for (const item of task.reviewItems || []) {
+    if (item.source === "notebook") {
+      const note = app.state.aiNotebook.find((record) => record.id === item.itemId);
+      if (!note) continue;
+      note.ease = Math.min(6, Number(note.ease || 1) + 1);
+      note.nextReviewDate = addDays(today, reviewInterval(note.ease));
+      note.lastReviewedAt = new Date().toISOString();
+    }
+    if (item.source === "quiz") {
+      const result = app.state.quizResults[item.itemId];
+      if (!result) continue;
+      result.reviewedAt = new Date().toISOString();
+      result.nextReviewDate = addDays(today, 3);
+    }
+  }
+}
+
+function reviewInterval(ease) {
+  return [1, 2, 4, 7, 14, 30][Math.max(0, Math.min(5, Number(ease || 1) - 1))];
+}
+
+async function generateQuiz(taskId) {
+  const task = taskRegistry.get(taskId);
+  if (!task) return;
+  const key = quizKeyForTask(task);
+  app.state.quizCache[key] = { status: "loading", title: "正在生成小测", questions: [] };
+  saveState();
+  render();
+  try {
+    const entries = refsToEntries(task.entryRefs || []);
+    const entryContext = await contextForEntries(entries);
+    const payload = await aiFetch("/api/deepseek/quiz", {
+      date: app.selectedDate,
+      taskLabel: task.label,
+      entries: entries.map((entry) => ({ ref: entryRef(entry), level: entry.level, number: entry.number, title: entry.title })),
+      entryContext,
+    });
+    app.state.quizCache[key] = {
+      ...payload.quiz,
+      status: "ready",
+      createdAt: new Date().toISOString(),
+      taskId: task.id,
+      sourceTaskIds: task.sourceTaskIds || [],
+      entryRefs: task.entryRefs || [],
+    };
+    app.state.quizResults[key] = app.state.quizResults[key] || { answers: {}, checked: {}, entryRefs: task.entryRefs || [] };
+  } catch (error) {
+    app.state.quizCache[key] = { status: "error", message: error.message, questions: [] };
+  }
+  saveState();
+  render();
+}
+
+function answerQuizChoice(quizKey, questionId, value) {
+  const quiz = app.state.quizCache[quizKey];
+  const question = quiz?.questions?.find((item) => item.id === questionId);
+  if (!question) return;
+  const result = ensureQuizResult(quizKey, quiz);
+  result.answers[questionId] = value;
+  result.checked[questionId] = {
+    correct: normalizeAnswer(value) === normalizeAnswer(question.answer),
+    feedback: question.explanation || `正确答案：${question.answer}`,
+    score: normalizeAnswer(value) === normalizeAnswer(question.answer) ? 100 : 0,
+  };
+  updateQuizScore(quizKey);
+  saveState();
+  render();
+}
+
+function checkQuizBlank(quizKey, questionId) {
+  const quiz = app.state.quizCache[quizKey];
+  const question = quiz?.questions?.find((item) => item.id === questionId);
+  if (!question) return;
+  const value = document.querySelector(`#${domId(`${quizKey}-${questionId}`)}`)?.value || "";
+  const correct = normalizeAnswer(value) === normalizeAnswer(question.answer);
+  const result = ensureQuizResult(quizKey, quiz);
+  result.answers[questionId] = value;
+  result.checked[questionId] = {
+    correct,
+    feedback: correct ? `正确。${question.explanation || ""}` : `参考答案：${question.answer}。${question.explanation || ""}`,
+    score: correct ? 100 : 0,
+  };
+  updateQuizScore(quizKey);
+  saveState();
+  render();
+}
+
+async function gradeQuizSentence(quizKey, questionId) {
+  const quiz = app.state.quizCache[quizKey];
+  const question = quiz?.questions?.find((item) => item.id === questionId);
+  if (!question) return;
+  const value = document.querySelector(`#${domId(`${quizKey}-${questionId}`)}`)?.value || "";
+  const result = ensureQuizResult(quizKey, quiz);
+  result.answers[questionId] = value;
+  result.checked[questionId] = { feedback: "AI 正在批改...", score: 0 };
+  saveState();
+  render();
+  try {
+    const entryContext = await contextForEntries(refsToEntries(quiz.entryRefs || []));
+    const payload = await aiFetch("/api/deepseek/grade-sentence", {
+      prompt: question.prompt,
+      answer: value,
+      grammarRef: question.grammarRef,
+      entryContext,
+    });
+    result.checked[questionId] = {
+      correct: Number(payload.grade.score || 0) >= 70,
+      feedback: `${payload.grade.feedback || ""}${payload.grade.corrected ? ` 改写：${payload.grade.corrected}` : ""}`,
+      score: Number(payload.grade.score || 0),
+    };
+  } catch (error) {
+    result.checked[questionId] = { correct: false, feedback: error.message, score: 0 };
+  }
+  updateQuizScore(quizKey);
+  saveState();
+  render();
+}
+
+function ensureQuizResult(quizKey, quiz) {
+  app.state.quizResults[quizKey] = app.state.quizResults[quizKey] || { answers: {}, checked: {}, entryRefs: quiz.entryRefs || [] };
+  app.state.quizResults[quizKey].answers = app.state.quizResults[quizKey].answers || {};
+  app.state.quizResults[quizKey].checked = app.state.quizResults[quizKey].checked || {};
+  return app.state.quizResults[quizKey];
+}
+
+function updateQuizScore(quizKey) {
+  const quiz = app.state.quizCache[quizKey];
+  const result = app.state.quizResults[quizKey];
+  if (!quiz || !result) return;
+  const scores = (quiz.questions || []).map((question) => result.checked?.[question.id]?.score).filter((score) => typeof score === "number");
+  result.score = scores.length ? Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length) : null;
+  if (scores.length === (quiz.questions || []).length) {
+    result.completedAt = result.completedAt || new Date().toISOString();
+    if (result.score < 70) result.nextReviewDate = result.nextReviewDate || addDays(todayIso(), 1);
+  }
+}
+
+function quizKeyForTask(task) {
+  const sourceId = task.sourceTaskIds?.[0] || task.id;
+  return `${app.selectedDate}:${sourceId}`;
+}
+
+async function contextForEntries(entries) {
+  const chunks = [];
+  for (const entry of entries.slice(0, 12)) {
+    const text = await getEntryText(entry);
+    chunks.push(`## ${entryRef(entry)} ${entry.title}\n${text}`);
+  }
+  return chunks.join("\n\n");
+}
+
+async function aiFetch(path, payload) {
+  const base = (app.state.settings.ai?.proxyUrl || AI_PROXY_DEFAULT).replace(/\/$/, "");
+  const response = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || data.error || `AI 代理错误 ${response.status}`);
+  return data;
+}
+
+function normalizeAnswer(value) {
+  return String(value || "").trim().replace(/[。．.]/g, "").replace(/\s+/g, "").toLowerCase();
 }
 
 function updateCatalogField(entryId, field, value) {
@@ -1464,10 +2100,27 @@ function formatShortDate(date) {
   }).format(value);
 }
 
+function formatDateTime(value) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function domId(value) {
+  return `id-${hashRefs([String(value)])}`;
+}
+
 function escapeAttr(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+function escapeHtml(value) {
+  return escapeAttr(value);
 }
