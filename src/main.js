@@ -29,6 +29,8 @@ let pdfDoc = null;
 let pdfRenderTask = null;
 let taskRegistry = new Map();
 let pdfIndexPromise = null;
+let selDragActive = false;
+let selAnchorPoint = null;
 let app = {
   view: "today",
   selectedDate: clampDate(todayIso(), START_DATE, END_DATE),
@@ -41,9 +43,6 @@ let app = {
   state: loadState(),
 };
 
-let rectDragStart = null;
-let rectDragCurrent = null;
-let rectDragActive = false;
 
 document.addEventListener("DOMContentLoaded", init);
 
@@ -1085,103 +1084,97 @@ function openReader(page, title) {
   render();
 }
 
-function handleTextSelection() {
+function handleSelMouseDown(event) {
   if (app.view !== "reader") return;
-  if (app.readerSelectionMode === "rect") return;
-  const shell = document.querySelector(".reader-shell");
-  const layer = document.querySelector("#textLayer");
-  if (!shell || !layer) return;
-  const selection = window.getSelection();
-  const text = selection ? selection.toString().trim() : "";
-  if (!selection || selection.rangeCount === 0 || !text) return;
-  const anchorNode = selection.anchorNode?.nodeType === Node.TEXT_NODE ? selection.anchorNode.parentElement : selection.anchorNode;
-  const focusNode = selection.focusNode?.nodeType === Node.TEXT_NODE ? selection.focusNode.parentElement : selection.focusNode;
-  if (!shell.contains(anchorNode) && !shell.contains(focusNode)) return;
-  if (!layer.contains(anchorNode) && !layer.contains(focusNode)) return;
-  const rect = selection.getRangeAt(0).getBoundingClientRect();
-  const wrapRect = layer.getBoundingClientRect();
-  const currentEntry = currentEntryForPage(app.readerPage);
-  app.readerSelection = {
-    text,
-    page: app.readerPage,
-    entryRef: currentEntry?.id || "",
-    selectedAt: new Date().toISOString(),
-  };
-  const tools = document.querySelector("#selectionTools");
-  if (tools) {
-    tools.hidden = false;
-    tools.style.left = `${clampNumber(rect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
-    tools.style.top = `${clampNumber(rect.top - wrapRect.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
-    tools.innerHTML = `
-      <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
-      <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
-      <button class="small" data-action="ai-save-selection" data-source="selection">收藏</button>
-    `;
+  if (event.target.closest("#selectionTools")) return;
+  if (event.target.closest("#textLayer")) {
+    selDragActive = true;
+    selAnchorPoint = { x: event.clientX, y: event.clientY };
+    clearSpanHighlights();
+    const tools = document.querySelector("#selectionTools");
+    if (tools) tools.hidden = true;
+  } else {
+    clearSpanHighlights();
   }
-  renderReaderSidePanel();
 }
 
-function handleRectDragStart(event) {
-  if (app.view !== "reader" || app.readerSelectionMode !== "rect") return;
-  const wrap = event.target.closest(".canvas-wrap");
-  if (!wrap) return;
-  event.preventDefault();
-  const wrapRect = wrap.getBoundingClientRect();
-  rectDragStart = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
-  rectDragCurrent = { ...rectDragStart };
-  rectDragActive = true;
-  const tools = document.querySelector("#selectionTools");
-  if (tools) tools.hidden = true;
-  const overlay = document.querySelector("#rectSelectOverlay");
-  if (overlay) overlay.hidden = true;
-}
-
-function handleRectDragMove(event) {
-  if (!rectDragActive) return;
-  const wrap = document.querySelector(".canvas-wrap");
-  if (!wrap) return;
-  const wrapRect = wrap.getBoundingClientRect();
-  rectDragCurrent = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
-  const overlay = document.querySelector("#rectSelectOverlay");
-  if (!overlay) return;
-  overlay.hidden = false;
-  const left = Math.min(rectDragStart.x, rectDragCurrent.x);
-  const top = Math.min(rectDragStart.y, rectDragCurrent.y);
-  const width = Math.abs(rectDragCurrent.x - rectDragStart.x);
-  const height = Math.abs(rectDragCurrent.y - rectDragStart.y);
-  overlay.style.left = `${left}px`;
-  overlay.style.top = `${top}px`;
-  overlay.style.width = `${width}px`;
-  overlay.style.height = `${height}px`;
-}
-
-function handleRectDragEnd(event) {
-  if (!rectDragActive) return;
-  rectDragActive = false;
-  const overlay = document.querySelector("#rectSelectOverlay");
-  if (overlay) overlay.hidden = true;
-  const wrap = document.querySelector(".canvas-wrap");
+function handleSelMouseMove(event) {
+  if (!selDragActive || !selAnchorPoint) return;
   const layer = document.querySelector("#textLayer");
-  if (!wrap || !layer) return;
+  const wrap = document.querySelector(".canvas-wrap");
+  if (!layer || !wrap) return;
   const wrapRect = wrap.getBoundingClientRect();
-  rectDragCurrent = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
-  const selBox = {
-    left: Math.min(rectDragStart.x, rectDragCurrent.x),
-    top: Math.min(rectDragStart.y, rectDragCurrent.y),
-    right: Math.max(rectDragStart.x, rectDragCurrent.x),
-    bottom: Math.max(rectDragStart.y, rectDragCurrent.y),
+  const selBox = buildSelBox(selAnchorPoint, { x: event.clientX, y: event.clientY }, wrapRect);
+  clearSpanHighlights();
+  collectSpansInRect(layer, selBox, wrapRect).forEach((s) => s.classList.add("span-selected"));
+}
+
+function handleSelMouseUp(event) {
+  if (!selDragActive) return;
+  selDragActive = false;
+  selAnchorPoint = null;
+  finalizeSpanSelection();
+}
+
+function handleSelDblClick(event) {
+  if (app.view !== "reader") return;
+  const span = event.target.closest("#textLayer span");
+  if (!span) return;
+  event.preventDefault();
+  clearSpanHighlights();
+  selectSentenceAround(span);
+  finalizeSpanSelection();
+}
+
+function clearSpanHighlights() {
+  document.querySelectorAll("#textLayer span.span-selected").forEach((s) => s.classList.remove("span-selected"));
+}
+
+function buildSelBox(anchor, current, wrapRect, expand = 3) {
+  return {
+    left: Math.min(anchor.x, current.x) - wrapRect.left - expand,
+    top: Math.min(anchor.y, current.y) - wrapRect.top - expand,
+    right: Math.max(anchor.x, current.x) - wrapRect.left + expand,
+    bottom: Math.max(anchor.y, current.y) - wrapRect.top + expand,
   };
-  rectDragStart = null;
-  rectDragCurrent = null;
-  if (selBox.right - selBox.left < 4 && selBox.bottom - selBox.top < 4) return;
-  const matched = collectSpansInRect(layer, selBox, wrapRect);
-  if (!matched.length) return;
-  const ordered = matched.sort((a, b) => {
+}
+
+function sortSpansByReadingOrder(spans) {
+  return spans.slice().sort((a, b) => {
     const ra = a.getBoundingClientRect();
     const rb = b.getBoundingClientRect();
     const threshold = Math.max(ra.height, rb.height) * 0.5;
     return Math.abs(ra.top - rb.top) > threshold ? ra.top - rb.top : ra.left - rb.left;
   });
+}
+
+function selectSentenceAround(clickedSpan) {
+  const layer = document.querySelector("#textLayer");
+  if (!layer) return;
+  const all = sortSpansByReadingOrder(Array.from(layer.querySelectorAll("span")));
+  const idx = all.indexOf(clickedSpan);
+  if (idx === -1) return;
+  const SENT_END = /[。！？…]/;
+  let start = idx;
+  for (let i = idx - 1; i >= 0; i--) {
+    if (SENT_END.test(all[i].textContent)) { start = i + 1; break; }
+    start = i;
+  }
+  let end = idx;
+  for (let i = idx; i < all.length; i++) {
+    end = i;
+    if (SENT_END.test(all[i].textContent)) break;
+  }
+  for (let i = start; i <= end; i++) all[i].classList.add("span-selected");
+}
+
+function finalizeSpanSelection() {
+  const layer = document.querySelector("#textLayer");
+  const wrap = document.querySelector(".canvas-wrap");
+  if (!layer || !wrap) return;
+  const selected = Array.from(layer.querySelectorAll("span.span-selected"));
+  if (!selected.length) return;
+  const ordered = sortSpansByReadingOrder(selected);
   const text = ordered.map((s) => s.textContent).join("").trim();
   if (!text) return;
   const currentEntry = currentEntryForPage(app.readerPage);
@@ -1191,12 +1184,13 @@ function handleRectDragEnd(event) {
     entryRef: currentEntry?.id || "",
     selectedAt: new Date().toISOString(),
   };
+  const wrapRect = wrap.getBoundingClientRect();
+  const firstRect = ordered[0].getBoundingClientRect();
   const tools = document.querySelector("#selectionTools");
   if (tools) {
     tools.hidden = false;
-    const firstSpanRect = ordered[0].getBoundingClientRect();
-    tools.style.left = `${clampNumber(firstSpanRect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
-    tools.style.top = `${clampNumber(selBox.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
+    tools.style.left = `${clampNumber(firstRect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
+    tools.style.top = `${clampNumber(firstRect.top - wrapRect.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
     tools.innerHTML = `
       <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
       <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
