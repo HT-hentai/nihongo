@@ -1,0 +1,8 @@
+public/materials/bluebooks/*.pdf
+public/materials/past-papers/**/*.pdf
+public/materials/past-papers/**/*.mp3
+public/materials/past-papers/**/*.m4a
+public/materials/past-papers/**/*.zip
+public/data/vocab/
+.DS_Store
+*.log
