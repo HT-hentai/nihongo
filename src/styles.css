@@ -995,6 +995,24 @@ textarea.quiz-input {
   display: none;
 }
 
+.rect-select-overlay {
+  position: absolute;
+  border: 2px solid var(--teal);
+  background: rgba(0, 209, 168, 0.10);
+  border-radius: 3px;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.rect-select-overlay[hidden] {
+  display: none;
+}
+
+.canvas-wrap.rect-mode .text-layer {
+  user-select: none;
+  cursor: crosshair;
+}
+
 .annotation-layer button:hover {
   background: rgba(0, 209, 168, 0.22);
   transform: none;

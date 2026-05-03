@@ -41,6 +41,10 @@ let app = {
   state: loadState(),
 };
 
+let rectDragStart = null;
+let rectDragCurrent = null;
+let rectDragActive = false;
+
 document.addEventListener("DOMContentLoaded", init);
 
 async function init() {
@@ -200,9 +204,10 @@ function bindGlobalActions() {
     }
   });
 
-  document.addEventListener("mouseup", () => window.setTimeout(handleTextSelection, 0));
-  document.addEventListener("keyup", () => window.setTimeout(handleTextSelection, 0));
-  document.addEventListener("touchend", () => window.setTimeout(handleTextSelection, 80));
+  document.addEventListener("mousedown", handleSelMouseDown);
+  document.addEventListener("mousemove", handleSelMouseMove);
+  document.addEventListener("mouseup", handleSelMouseUp);
+  document.addEventListener("dblclick", handleSelDblClick);
 }
 
 async function getPdfJs() {
@@ -1082,6 +1087,7 @@ function openReader(page, title) {
 
 function handleTextSelection() {
   if (app.view !== "reader") return;
+  if (app.readerSelectionMode === "rect") return;
   const shell = document.querySelector(".reader-shell");
   const layer = document.querySelector("#textLayer");
   if (!shell || !layer) return;
@@ -1113,6 +1119,102 @@ function handleTextSelection() {
     `;
   }
   renderReaderSidePanel();
+}
+
+function handleRectDragStart(event) {
+  if (app.view !== "reader" || app.readerSelectionMode !== "rect") return;
+  const wrap = event.target.closest(".canvas-wrap");
+  if (!wrap) return;
+  event.preventDefault();
+  const wrapRect = wrap.getBoundingClientRect();
+  rectDragStart = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
+  rectDragCurrent = { ...rectDragStart };
+  rectDragActive = true;
+  const tools = document.querySelector("#selectionTools");
+  if (tools) tools.hidden = true;
+  const overlay = document.querySelector("#rectSelectOverlay");
+  if (overlay) overlay.hidden = true;
+}
+
+function handleRectDragMove(event) {
+  if (!rectDragActive) return;
+  const wrap = document.querySelector(".canvas-wrap");
+  if (!wrap) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  rectDragCurrent = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
+  const overlay = document.querySelector("#rectSelectOverlay");
+  if (!overlay) return;
+  overlay.hidden = false;
+  const left = Math.min(rectDragStart.x, rectDragCurrent.x);
+  const top = Math.min(rectDragStart.y, rectDragCurrent.y);
+  const width = Math.abs(rectDragCurrent.x - rectDragStart.x);
+  const height = Math.abs(rectDragCurrent.y - rectDragStart.y);
+  overlay.style.left = `${left}px`;
+  overlay.style.top = `${top}px`;
+  overlay.style.width = `${width}px`;
+  overlay.style.height = `${height}px`;
+}
+
+function handleRectDragEnd(event) {
+  if (!rectDragActive) return;
+  rectDragActive = false;
+  const overlay = document.querySelector("#rectSelectOverlay");
+  if (overlay) overlay.hidden = true;
+  const wrap = document.querySelector(".canvas-wrap");
+  const layer = document.querySelector("#textLayer");
+  if (!wrap || !layer) return;
+  const wrapRect = wrap.getBoundingClientRect();
+  rectDragCurrent = { x: event.clientX - wrapRect.left, y: event.clientY - wrapRect.top };
+  const selBox = {
+    left: Math.min(rectDragStart.x, rectDragCurrent.x),
+    top: Math.min(rectDragStart.y, rectDragCurrent.y),
+    right: Math.max(rectDragStart.x, rectDragCurrent.x),
+    bottom: Math.max(rectDragStart.y, rectDragCurrent.y),
+  };
+  rectDragStart = null;
+  rectDragCurrent = null;
+  if (selBox.right - selBox.left < 4 && selBox.bottom - selBox.top < 4) return;
+  const matched = collectSpansInRect(layer, selBox, wrapRect);
+  if (!matched.length) return;
+  const ordered = matched.sort((a, b) => {
+    const ra = a.getBoundingClientRect();
+    const rb = b.getBoundingClientRect();
+    const threshold = Math.max(ra.height, rb.height) * 0.5;
+    return Math.abs(ra.top - rb.top) > threshold ? ra.top - rb.top : ra.left - rb.left;
+  });
+  const text = ordered.map((s) => s.textContent).join("").trim();
+  if (!text) return;
+  const currentEntry = currentEntryForPage(app.readerPage);
+  app.readerSelection = {
+    text,
+    page: app.readerPage,
+    entryRef: currentEntry?.id || "",
+    selectedAt: new Date().toISOString(),
+  };
+  const tools = document.querySelector("#selectionTools");
+  if (tools) {
+    tools.hidden = false;
+    const firstSpanRect = ordered[0].getBoundingClientRect();
+    tools.style.left = `${clampNumber(firstSpanRect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
+    tools.style.top = `${clampNumber(selBox.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
+    tools.innerHTML = `
+      <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
+      <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
+      <button class="small" data-action="ai-save-selection" data-source="selection">收藏</button>
+    `;
+  }
+  renderReaderSidePanel();
+}
+
+function collectSpansInRect(layer, selBox, wrapRect) {
+  return Array.from(layer.querySelectorAll("span")).filter((span) => {
+    const r = span.getBoundingClientRect();
+    const sl = r.left - wrapRect.left;
+    const st = r.top - wrapRect.top;
+    const sr = r.right - wrapRect.left;
+    const sb = r.bottom - wrapRect.top;
+    return !(sr < selBox.left || sl > selBox.right || sb < selBox.top || st > selBox.bottom);
+  });
 }
 
 async function explainReaderSelection(mode) {
