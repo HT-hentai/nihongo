@@ -955,13 +955,28 @@ textarea.quiz-input {
   user-select: none;
 }
 
+.selection-highlight-layer {
+  position: absolute;
+  inset: 20px;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.selection-highlight-box {
+  position: absolute;
+  border-radius: 3px;
+  background: rgba(0, 209, 168, 0.30);
+  box-shadow: 0 0 0 1px rgba(0, 209, 168, 0.16);
+}
+
 .text-layer span {
   position: absolute;
   color: transparent;
   white-space: pre;
   line-height: 1;
   transform-origin: 0 0;
-  cursor: text;
+  cursor: crosshair;
 }
 
 .text-layer span.span-selected {

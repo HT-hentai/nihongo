@@ -23,14 +23,21 @@ const PDFJS_CDN_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/
 const PDF_INDEX_DB = "bluebook-ai-pdf-index-v1";
 const PDF_INDEX_META_KEY = "bluebook";
 const AI_PROXY_DEFAULT = "http://localhost:8788";
+const SELECTION_REFINEMENT_DELAY = 220;
 
 let pdfjsLib = null;
 let pdfDoc = null;
 let pdfRenderTask = null;
 let taskRegistry = new Map();
 let pdfIndexPromise = null;
+let readerTextModel = null;
 let selDragActive = false;
 let selAnchorPoint = null;
+let selAnchorOffset = null;
+let selDragMoved = false;
+let selectionRefineTimer = null;
+let selectionRefineSeq = 0;
+const selectionRefineCache = new Map();
 let app = {
   view: "today",
   selectedDate: clampDate(todayIso(), START_DATE, END_DATE),
@@ -852,6 +859,7 @@ function renderReader() {
         <div class="canvas-wrap">
           <iframe id="pdfFallback" class="pdf-fallback" src="${app.state.pdf.publicUrl}#page=${app.readerPage}" title="蓝宝书 PDF"></iframe>
           <canvas id="pdfCanvas" style="display:none;"></canvas>
+          <div id="selectionHighlightLayer" class="selection-highlight-layer"></div>
           <div id="textLayer" class="text-layer"></div>
           <div id="annotationLayer" class="annotation-layer"></div>
           <div id="selectionTools" class="selection-tools" hidden></div>
@@ -891,10 +899,14 @@ function renderReaderAiPanel() {
         <button class="small" data-action="test-ai-connection">测试 AI 连接</button>
       </div>
       <div class="selection-card ${selection?.text ? "active" : ""}">
-        <span class="pill ${selection?.text ? "level" : "warn"}">当前选中</span>
+        <span class="pill ${selection?.text ? "level" : "warn"}">${selection?.text ? selectionSourceLabel(selection.source) : "当前选中"}</span>
+        ${selection?.kind ? `<span class="pill info">${escapeHtml(selection.kind)}</span>` : ""}
+        ${typeof selection?.confidence === "number" ? `<span class="pill info">置信 ${Math.round(selection.confidence * 100)}%</span>` : ""}
         ${selection?.text ? `
           <blockquote>${escapeHtml(selection.text)}</blockquote>
           <p class="task-meta">第 ${selection.page} 页${selection.entryRef ? ` · ${escapeHtml(selection.entryRef)}` : ""}</p>
+          ${selection.reason ? `<p class="task-meta">${escapeHtml(selection.reason)}</p>` : ""}
+          ${selection.refineStatus ? `<p class="task-meta">${escapeHtml(selection.refineStatus)}</p>` : ""}
           <div class="mini-toolbar">
             <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
             <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
@@ -1029,6 +1041,12 @@ async function renderTextLayer(page, viewport) {
   layer.innerHTML = "";
   layer.style.width = `${viewport.width}px`;
   layer.style.height = `${viewport.height}px`;
+  const highlightLayer = document.querySelector("#selectionHighlightLayer");
+  if (highlightLayer) {
+    highlightLayer.innerHTML = "";
+    highlightLayer.style.width = `${viewport.width}px`;
+    highlightLayer.style.height = `${viewport.height}px`;
+  }
   const textContent = await page.getTextContent();
   app.currentPageText = textContent.items.map((item) => item.str).join(" ").replace(/\s+/g, " ").trim();
   const lib = await getPdfJs();
@@ -1043,6 +1061,8 @@ async function renderTextLayer(page, viewport) {
     span.style.transform = `scaleX(${Math.max(0.7, Math.min(1.4, (item.width || 1) / Math.max(1, item.str.length * Math.max(8, Math.hypot(tx[0], tx[1])) * 0.5)))})`;
     layer.appendChild(span);
   }
+  readerTextModel = buildReaderTextModel(layer, app.readerPage);
+  restoreReaderSelectionHighlight();
 }
 
 async function renderAnnotations(page, viewport, layer) {
@@ -1086,57 +1106,128 @@ function openReader(page, title) {
 
 function handleSelMouseDown(event) {
   if (app.view !== "reader") return;
-  if (event.target.closest("#selectionTools")) return;
-  if (event.target.closest("#textLayer")) {
-    selDragActive = true;
-    selAnchorPoint = { x: event.clientX, y: event.clientY };
-    clearSpanHighlights();
-    const tools = document.querySelector("#selectionTools");
-    if (tools) tools.hidden = true;
-  } else {
-    clearSpanHighlights();
+  if (event.target.closest("#selectionTools") || event.target.closest(".panel")) return;
+  if (!event.target.closest("#textLayer")) {
+    clearSmartSelection();
+    return;
   }
+  const hit = hitTestReaderText(event.clientX, event.clientY);
+  if (!hit) return;
+  event.preventDefault();
+  cancelSelectionRefinement();
+  selDragActive = true;
+  selDragMoved = false;
+  selAnchorPoint = { x: event.clientX, y: event.clientY };
+  selAnchorOffset = hit.offset;
+  setReaderSelectionFromRange(localWordRangeForOffset(hit.offset), "local-word", {
+    anchorOffset: hit.offset,
+    showTools: false,
+  });
 }
 
 function handleSelMouseMove(event) {
-  if (!selDragActive || !selAnchorPoint) return;
-  const layer = document.querySelector("#textLayer");
-  const wrap = document.querySelector(".canvas-wrap");
-  if (!layer || !wrap) return;
-  const wrapRect = wrap.getBoundingClientRect();
-  const selBox = buildSelBox(selAnchorPoint, { x: event.clientX, y: event.clientY }, wrapRect);
-  clearSpanHighlights();
-  collectSpansInRect(layer, selBox, wrapRect).forEach((s) => s.classList.add("span-selected"));
+  if (!selDragActive || selAnchorOffset === null) return;
+  const hit = hitTestReaderText(event.clientX, event.clientY, true);
+  if (!hit) return;
+  const movedEnough = Math.abs(event.clientX - selAnchorPoint.x) + Math.abs(event.clientY - selAnchorPoint.y) > 4;
+  if (!movedEnough && !selDragMoved) return;
+  event.preventDefault();
+  selDragMoved = true;
+  setReaderSelectionFromRange(dragRangeForOffsets(selAnchorOffset, hit.offset), "manual", {
+    anchorOffset: selAnchorOffset,
+    showTools: false,
+  });
 }
 
 function handleSelMouseUp(event) {
   if (!selDragActive) return;
+  event.preventDefault();
+  const wasDrag = selDragMoved;
+  const anchorOffset = selAnchorOffset;
   selDragActive = false;
+  selDragMoved = false;
   selAnchorPoint = null;
-  finalizeSpanSelection();
+  selAnchorOffset = null;
+  if (wasDrag) {
+    showSelectionToolsForRange(app.readerSelection);
+    renderReaderSidePanel();
+    return;
+  }
+  if (anchorOffset !== null) {
+    setReaderSelectionFromRange(localWordRangeForOffset(anchorOffset), "local-word", {
+      anchorOffset,
+      showTools: true,
+      refine: true,
+    });
+  }
 }
 
 function handleSelDblClick(event) {
   if (app.view !== "reader") return;
-  const span = event.target.closest("#textLayer span");
-  if (!span) return;
+  if (event.target.closest(".panel")) return;
+  const hit = hitTestReaderText(event.clientX, event.clientY, true);
+  if (!hit) return;
   event.preventDefault();
-  clearSpanHighlights();
-  selectSentenceAround(span);
-  finalizeSpanSelection();
+  cancelSelectionRefinement();
+  setReaderSelectionFromRange(sentenceRangeForOffset(hit.offset), "sentence", {
+    anchorOffset: hit.offset,
+    showTools: true,
+  });
+  explainReaderSelection("sentence");
 }
 
-function clearSpanHighlights() {
-  document.querySelectorAll("#textLayer span.span-selected").forEach((s) => s.classList.remove("span-selected"));
-}
-
-function buildSelBox(anchor, current, wrapRect, expand = 3) {
+function buildReaderTextModel(layer, pageNumber) {
+  const layerRect = layer.getBoundingClientRect();
+  const spans = sortSpansByReadingOrder(Array.from(layer.querySelectorAll("span")));
+  const chars = [];
+  let text = "";
+  for (const span of spans) {
+    const glyphs = Array.from(span.textContent || "");
+    if (!glyphs.length) continue;
+    const rect = span.getBoundingClientRect();
+    const fontSize = Number.parseFloat(span.style.fontSize) || Math.max(8, rect.height);
+    const width = Math.max(rect.width, fontSize * glyphs.length * 0.52);
+    const left = rect.left - layerRect.left;
+    const top = rect.top - layerRect.top;
+    const bottom = rect.bottom - layerRect.top;
+    const charWidth = width / glyphs.length;
+    for (let index = 0; index < glyphs.length; index += 1) {
+      const glyph = glyphs[index];
+      const start = text.length;
+      text += glyph;
+      chars.push({
+        offset: start,
+        endOffset: text.length,
+        text: glyph,
+        span,
+        left: left + charWidth * index,
+        right: left + charWidth * (index + 1),
+        top,
+        bottom,
+      });
+    }
+  }
+  assignLineIndexes(chars);
   return {
-    left: Math.min(anchor.x, current.x) - wrapRect.left - expand,
-    top: Math.min(anchor.y, current.y) - wrapRect.top - expand,
-    right: Math.max(anchor.x, current.x) - wrapRect.left + expand,
-    bottom: Math.max(anchor.y, current.y) - wrapRect.top + expand,
+    page: pageNumber,
+    text,
+    chars,
+    words: buildWordRanges(text),
+    sentences: buildSentenceRanges(text),
   };
+}
+
+function assignLineIndexes(chars) {
+  const lines = [];
+  for (const char of chars) {
+    const middle = (char.top + char.bottom) / 2;
+    let lineIndex = lines.findIndex((line) => Math.abs(line.middle - middle) <= Math.max(6, line.height * 0.55));
+    if (lineIndex === -1) {
+      lineIndex = lines.length;
+      lines.push({ middle, height: char.bottom - char.top });
+    }
+    char.lineIndex = lineIndex;
+  }
 }
 
 function sortSpansByReadingOrder(spans) {
@@ -1148,82 +1239,353 @@ function sortSpansByReadingOrder(spans) {
   });
 }
 
-function selectSentenceAround(clickedSpan) {
+function hitTestReaderText(clientX, clientY, allowNearest = false) {
+  if (!readerTextModel?.chars?.length) return null;
   const layer = document.querySelector("#textLayer");
-  if (!layer) return;
-  const all = sortSpansByReadingOrder(Array.from(layer.querySelectorAll("span")));
-  const idx = all.indexOf(clickedSpan);
-  if (idx === -1) return;
-  const SENT_END = /[。！？…]/;
-  let start = idx;
-  for (let i = idx - 1; i >= 0; i--) {
-    if (SENT_END.test(all[i].textContent)) { start = i + 1; break; }
-    start = i;
+  if (!layer) return null;
+  const layerRect = layer.getBoundingClientRect();
+  const x = clientX - layerRect.left;
+  const y = clientY - layerRect.top;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const char of readerTextModel.chars) {
+    const pad = allowNearest ? 8 : 3;
+    const inside = x >= char.left - pad && x <= char.right + pad && y >= char.top - pad && y <= char.bottom + pad;
+    const cx = (char.left + char.right) / 2;
+    const cy = (char.top + char.bottom) / 2;
+    const dx = Math.max(char.left - x, 0, x - char.right);
+    const dy = Math.max(char.top - y, 0, y - char.bottom);
+    const distance = inside ? (cx - x) ** 2 + (cy - y) ** 2 : dx * dx + dy * dy;
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = char;
+    }
   }
-  let end = idx;
-  for (let i = idx; i < all.length; i++) {
-    end = i;
-    if (SENT_END.test(all[i].textContent)) break;
-  }
-  for (let i = start; i <= end; i++) all[i].classList.add("span-selected");
+  return nearest && nearestDistance <= (allowNearest ? 900 : 420) ? nearest : null;
 }
 
-function finalizeSpanSelection() {
-  const layer = document.querySelector("#textLayer");
-  const wrap = document.querySelector(".canvas-wrap");
-  if (!layer || !wrap) return;
-  const selected = Array.from(layer.querySelectorAll("span.span-selected"));
-  if (!selected.length) return;
-  const ordered = sortSpansByReadingOrder(selected);
-  const text = ordered.map((s) => s.textContent).join("").trim();
-  if (!text) return;
+function buildWordRanges(text) {
+  const ranges = [];
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    const segmenter = new Intl.Segmenter("ja", { granularity: "word" });
+    for (const segment of segmenter.segment(text)) {
+      const start = segment.index;
+      const end = start + segment.segment.length;
+      if (segment.isWordLike || /[一-龯々〆ヵヶぁ-んァ-ンーA-Za-z0-9]/.test(segment.segment)) {
+        ranges.push(trimRange({ start, end }, text));
+      }
+    }
+  }
+  if (!ranges.length) {
+    let start = null;
+    let previousType = "";
+    Array.from(text).forEach((char, index) => {
+      const type = charType(char);
+      if (!type) {
+        if (start !== null) ranges.push({ start, end: index });
+        start = null;
+        previousType = "";
+        return;
+      }
+      if (start === null || type !== previousType) {
+        if (start !== null) ranges.push({ start, end: index });
+        start = index;
+      }
+      previousType = type;
+    });
+    if (start !== null) ranges.push({ start, end: text.length });
+  }
+  return ranges.filter((range) => range.end > range.start);
+}
+
+function buildSentenceRanges(text) {
+  const ranges = [];
+  let start = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    if (/[。！？!?…]/.test(text[index])) {
+      const range = trimRange({ start, end: index + 1 }, text);
+      if (range.end > range.start) ranges.push(range);
+      start = index + 1;
+    }
+  }
+  const tail = trimRange({ start, end: text.length }, text);
+  if (tail.end > tail.start) ranges.push(tail);
+  return ranges.length ? ranges : [{ start: 0, end: text.length }];
+}
+
+function charType(char) {
+  if (/\s/.test(char)) return "";
+  if (/[一-龯々〆ヵヶ]/.test(char)) return "kanji";
+  if (/[ぁ-ん]/.test(char)) return "hiragana";
+  if (/[ァ-ンー]/.test(char)) return "katakana";
+  if (/[A-Za-z0-9]/.test(char)) return "latin";
+  return "symbol";
+}
+
+function localWordRangeForOffset(offset) {
+  const model = readerTextModel;
+  if (!model) return null;
+  const word = model.words.find((range) => offset >= range.start && offset < range.end);
+  if (word) return word;
+  const char = model.chars.find((item) => offset >= item.offset && offset < item.endOffset);
+  return char ? { start: char.offset, end: char.endOffset } : { start: offset, end: offset + 1 };
+}
+
+function sentenceRangeForOffset(offset) {
+  const model = readerTextModel;
+  if (!model) return null;
+  return model.sentences.find((range) => offset >= range.start && offset < range.end) || { start: 0, end: model.text.length };
+}
+
+function dragRangeForOffsets(anchorOffset, currentOffset) {
+  const startOffset = Math.min(anchorOffset, currentOffset);
+  const endOffset = Math.max(anchorOffset, currentOffset);
+  const startWord = localWordRangeForOffset(startOffset);
+  const endWord = localWordRangeForOffset(endOffset);
+  return trimRange({
+    start: startWord?.start ?? startOffset,
+    end: endWord?.end ?? endOffset + 1,
+  }, readerTextModel.text);
+}
+
+function trimRange(range, text) {
+  const safe = {
+    start: clampNumber(range?.start ?? 0, 0, text.length),
+    end: clampNumber(range?.end ?? 0, 0, text.length),
+  };
+  if (safe.end < safe.start) [safe.start, safe.end] = [safe.end, safe.start];
+  while (safe.start < safe.end && /\s/.test(text[safe.start])) safe.start += 1;
+  while (safe.end > safe.start && /\s/.test(text[safe.end - 1])) safe.end -= 1;
+  return safe;
+}
+
+function setReaderSelectionFromRange(range, source, options = {}) {
+  const model = readerTextModel;
+  if (!model || !range) return;
+  const normalized = trimRange(range, model.text);
+  if (normalized.end <= normalized.start) return;
+  const text = model.text.slice(normalized.start, normalized.end);
+  const anchorOffset = options.anchorOffset ?? normalized.start;
+  const sentence = sentenceRangeForOffset(anchorOffset);
   const currentEntry = currentEntryForPage(app.readerPage);
   app.readerSelection = {
     text,
     page: app.readerPage,
     entryRef: currentEntry?.id || "",
+    source,
+    startOffset: normalized.start,
+    endOffset: normalized.end,
+    sentenceStartOffset: sentence?.start ?? normalized.start,
+    sentenceEndOffset: sentence?.end ?? normalized.end,
+    sentenceText: sentence ? model.text.slice(sentence.start, sentence.end) : text,
+    anchorOffset,
     selectedAt: new Date().toISOString(),
+    kind: options.kind || "",
+    confidence: options.confidence,
+    reason: options.reason || "",
+    refineStatus: options.refineStatus || "",
   };
-  const wrapRect = wrap.getBoundingClientRect();
-  const firstRect = ordered[0].getBoundingClientRect();
-  const tools = document.querySelector("#selectionTools");
-  if (tools) {
-    tools.hidden = false;
-    tools.style.left = `${clampNumber(firstRect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
-    tools.style.top = `${clampNumber(firstRect.top - wrapRect.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
-    tools.innerHTML = `
-      <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
-      <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
-      <button class="small" data-action="ai-save-selection" data-source="selection">收藏</button>
-    `;
+  drawSelectionRange(app.readerSelection);
+  if (options.showTools !== false) showSelectionToolsForRange(app.readerSelection);
+  else hideSelectionTools();
+  renderReaderSidePanel();
+  if (options.refine) scheduleSelectionRefinement(app.readerSelection);
+}
+
+function drawSelectionRange(selection) {
+  const layer = document.querySelector("#selectionHighlightLayer");
+  if (!layer || !readerTextModel || !selection) return;
+  layer.innerHTML = "";
+  const chars = readerTextModel.chars.filter((char) => char.endOffset > selection.startOffset && char.offset < selection.endOffset && !/\s/.test(char.text));
+  for (const box of mergeHighlightBoxes(chars)) {
+    const marker = document.createElement("div");
+    marker.className = "selection-highlight-box";
+    marker.style.left = `${box.left}px`;
+    marker.style.top = `${box.top}px`;
+    marker.style.width = `${box.right - box.left}px`;
+    marker.style.height = `${box.bottom - box.top}px`;
+    layer.appendChild(marker);
   }
+}
+
+function mergeHighlightBoxes(chars) {
+  const boxes = [];
+  for (const char of chars) {
+    const last = boxes[boxes.length - 1];
+    const sameLine = last && last.lineIndex === char.lineIndex;
+    const close = sameLine && char.left - last.right <= 3;
+    if (close) {
+      last.right = Math.max(last.right, char.right);
+      last.top = Math.min(last.top, char.top);
+      last.bottom = Math.max(last.bottom, char.bottom);
+    } else {
+      boxes.push({ left: char.left, right: char.right, top: char.top, bottom: char.bottom, lineIndex: char.lineIndex });
+    }
+  }
+  return boxes;
+}
+
+function showSelectionToolsForRange(selection) {
+  if (!selection || !readerTextModel) return;
+  const tools = document.querySelector("#selectionTools");
+  const layer = document.querySelector("#textLayer");
+  const wrap = document.querySelector(".canvas-wrap");
+  if (!tools || !layer || !wrap) return;
+  const firstChar = readerTextModel.chars.find((char) => char.endOffset > selection.startOffset && char.offset < selection.endOffset);
+  if (!firstChar) return;
+  tools.hidden = false;
+  const maxLeft = Math.max(12, wrap.clientWidth - 282);
+  const maxTop = Math.max(12, wrap.clientHeight - 58);
+  tools.style.left = `${clampNumber(layer.offsetLeft + firstChar.left, 12, maxLeft)}px`;
+  tools.style.top = `${clampNumber(layer.offsetTop + firstChar.top - 46, 12, maxTop)}px`;
+  tools.innerHTML = `
+    <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
+    <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
+    <button class="small" data-action="ai-save-selection" data-source="selection">收藏</button>
+  `;
+}
+
+function hideSelectionTools() {
+  const tools = document.querySelector("#selectionTools");
+  if (tools) tools.hidden = true;
+}
+
+function clearSmartSelection() {
+  cancelSelectionRefinement();
+  const highlightLayer = document.querySelector("#selectionHighlightLayer");
+  if (highlightLayer) highlightLayer.innerHTML = "";
+  hideSelectionTools();
+  app.readerSelection = null;
   renderReaderSidePanel();
 }
 
-function collectSpansInRect(layer, selBox, wrapRect) {
-  return Array.from(layer.querySelectorAll("span")).filter((span) => {
-    const r = span.getBoundingClientRect();
-    const sl = r.left - wrapRect.left;
-    const st = r.top - wrapRect.top;
-    const sr = r.right - wrapRect.left;
-    const sb = r.bottom - wrapRect.top;
-    return !(sr < selBox.left || sl > selBox.right || sb < selBox.top || st > selBox.bottom);
+function restoreReaderSelectionHighlight() {
+  if (!app.readerSelection || app.readerSelection.page !== app.readerPage || app.readerSelection.startOffset === undefined) return;
+  drawSelectionRange(app.readerSelection);
+  showSelectionToolsForRange(app.readerSelection);
+}
+
+function selectionSourceLabel(source) {
+  return {
+    "local-word": "本地选词",
+    ai: "AI修正",
+    manual: "手动词组",
+    sentence: "整句",
+  }[source] || "当前选中";
+}
+
+function cancelSelectionRefinement() {
+  selectionRefineSeq += 1;
+  if (selectionRefineTimer) {
+    window.clearTimeout(selectionRefineTimer);
+    selectionRefineTimer = null;
+  }
+}
+
+function scheduleSelectionRefinement(selection) {
+  if (!selection?.sentenceText || selection.source !== "local-word") return;
+  const token = ++selectionRefineSeq;
+  const snapshot = { ...selection };
+  if (selectionRefineTimer) window.clearTimeout(selectionRefineTimer);
+  selectionRefineTimer = window.setTimeout(() => refineSelectionWithAi(snapshot, token), SELECTION_REFINEMENT_DELAY);
+}
+
+async function refineSelectionWithAi(snapshot, token) {
+  if (!isCurrentSelection(snapshot, token)) return;
+  const cacheKey = selectionRefineCacheKey(snapshot);
+  const cached = selectionRefineCache.get(cacheKey);
+  if (cached) {
+    applyRefinedSelection(cached, snapshot, token);
+    return;
+  }
+  app.readerSelection.refineStatus = "AI 正在修正词/语法边界...";
+  renderReaderSidePanel();
+  try {
+    const currentEntry = currentEntryForPage(app.readerPage);
+    const payload = await aiFetch("/api/deepseek/refine-selection", {
+      sentenceText: snapshot.sentenceText,
+      anchorOffset: Math.max(0, snapshot.anchorOffset - snapshot.sentenceStartOffset),
+      localSelectedText: snapshot.text,
+      currentEntry,
+      entryContext: currentEntry ? `${entryRef(currentEntry)} ${currentEntry.title}` : "",
+    });
+    const refined = payload.selection || payload;
+    selectionRefineCache.set(cacheKey, refined);
+    applyRefinedSelection(refined, snapshot, token);
+  } catch (error) {
+    if (!isCurrentSelection(snapshot, token)) return;
+    app.readerSelection.refineStatus = `AI 修正暂不可用，本地选词已保留：${error.message}`;
+    renderReaderSidePanel();
+  }
+}
+
+function applyRefinedSelection(refined, snapshot, token) {
+  if (!isCurrentSelection(snapshot, token)) return;
+  const range = refinedRangeToPageRange(refined, snapshot);
+  if (!range) {
+    app.readerSelection.refineStatus = "AI 没有返回可用边界，本地选词已保留。";
+    renderReaderSidePanel();
+    return;
+  }
+  setReaderSelectionFromRange(range, "ai", {
+    anchorOffset: snapshot.anchorOffset,
+    showTools: true,
+    kind: refined.kind || "词句",
+    confidence: typeof refined.confidence === "number" ? refined.confidence : null,
+    reason: refined.reason || "",
   });
+}
+
+function refinedRangeToPageRange(refined, snapshot) {
+  const sentenceStart = snapshot.sentenceStartOffset;
+  const sentenceEnd = snapshot.sentenceEndOffset;
+  let start = sentenceStart + Number(refined.startOffset);
+  let end = sentenceStart + Number(refined.endOffset);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    const text = String(refined.text || "").trim();
+    const index = text ? snapshot.sentenceText.indexOf(text) : -1;
+    if (index === -1) return null;
+    start = sentenceStart + index;
+    end = start + text.length;
+  }
+  start = clampNumber(start, sentenceStart, sentenceEnd);
+  end = clampNumber(end, sentenceStart, sentenceEnd);
+  return end > start ? { start, end } : null;
+}
+
+function isCurrentSelection(snapshot, token) {
+  const selection = app.readerSelection;
+  return token === selectionRefineSeq
+    && selection
+    && selection.page === snapshot.page
+    && selection.source === "local-word"
+    && selection.startOffset === snapshot.startOffset
+    && selection.endOffset === snapshot.endOffset;
+}
+
+function selectionRefineCacheKey(selection) {
+  return [
+    selection.page,
+    selection.sentenceStartOffset,
+    hashRefs([selection.sentenceText]),
+    selection.anchorOffset - selection.sentenceStartOffset,
+    selection.text,
+  ].join(":");
 }
 
 async function explainReaderSelection(mode) {
   if (!app.readerSelection?.text) return;
   app.aiPanel = { status: "loading", message: "", result: null };
-  render();
+  renderReaderSidePanel();
   try {
     const context = await collectReaderContext();
     const payload = await aiFetch("/api/deepseek/explain", { mode, ...context });
     app.aiPanel = { status: "done", message: "", result: payload.explanation };
     saveState();
-    render();
+    renderReaderSidePanel();
   } catch (error) {
     app.aiPanel = { status: "error", message: error.message, result: null };
-    render();
+    renderReaderSidePanel();
   }
 }
 

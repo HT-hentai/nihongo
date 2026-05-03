@@ -2,15 +2,15 @@
 
 本地静态网页应用，用你的蓝宝书 PDF 生成 N4/N3/N2 文法条目计划，并同步每日完成情况。
 
-当前分支是 `codex/ai-study-assistant-experiment`，在本地静态版上增加 DeepSeek AI 学习助手实验功能。
+当前智能选词版本分支是 `codex/pdf-smart-selection`，在本地静态版上增加 DeepSeek AI 学习助手和 PDF 智能选区实验功能。
 
 ## Run
 
 ```bash
-python3 -m http.server 5173
+python3 -m http.server 5175
 ```
 
-然后打开 <http://localhost:5173>。
+然后打开 <http://localhost:5175>。
 
 ## DeepSeek AI Assistant
 
@@ -44,6 +44,7 @@ node ai-proxy/index.mjs
 
 - PDF 阅读器会用 PDF.js 在浏览器 IndexedDB 建立本机文本索引；索引不提交、不导出。
 - 选中 PDF 里的词或例句后，可让 AI 解释句中含义、语法点，并收藏进 AI 生词本。
+- PDF 智能选区支持单击本地选词、DeepSeek 异步修正为词/语法块、拖动扩展词组、双击选整句并自动解释。
 - 今日文法任务可生成混合小测：选择题、填空题、造句题。
 - 收藏项和低分小测会生成 `AI 生词/例句复习` 任务，加入原有滚动计划。
 

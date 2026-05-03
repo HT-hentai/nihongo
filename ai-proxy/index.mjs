@@ -32,6 +32,9 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/deepseek/explain") {
       return json(res, 200, await explain(body));
     }
+    if (req.method === "POST" && url.pathname === "/api/deepseek/refine-selection") {
+      return json(res, 200, await refineSelection(body));
+    }
     if (req.method === "POST" && url.pathname === "/api/deepseek/quiz") {
       return json(res, 200, await quiz(body));
     }
@@ -94,6 +97,39 @@ async function explain(body) {
   };
   const result = await deepseekJson(system, user, 2400);
   return { explanation: result, usage: result.__usage };
+}
+
+async function refineSelection(body) {
+  const system = [
+    "你是日语分词和 JLPT 语法块识别助手。",
+    "必须输出 JSON 对象，不要输出 Markdown。",
+    "startOffset/endOffset 必须是相对 sentenceText 的 JavaScript 字符串索引，endOffset 为开区间。",
+    "优先返回自然单词、固定表达或完整语法块；不要扩到整句，除非局部本身就是整句表达。",
+  ].join("\n");
+  const user = {
+    task: "refine_pdf_text_selection",
+    output_json_shape: {
+      text: "修正后的日文选区",
+      startOffset: 0,
+      endOffset: 0,
+      kind: "word|phrase|grammar|expression",
+      confidence: 0.0,
+      reason: "中文说明，说明为什么扩成这个范围",
+    },
+    sentenceText: truncate(body.sentenceText, 1200),
+    anchorOffset: Number(body.anchorOffset || 0),
+    localSelectedText: truncate(body.localSelectedText, 200),
+    currentEntry: body.currentEntry || null,
+    entryContext: truncate(body.entryContext, 800),
+    requirements: [
+      "anchorOffset 是用户点击位置在 sentenceText 内的索引。",
+      "返回范围必须覆盖 anchorOffset。",
+      "如果 localSelectedText 已经正确，只返回同样范围。",
+      "如果点击在语法表达中，返回完整语法块，例如 なくてはならない、にしたがって、ということだ。",
+    ],
+  };
+  const result = await deepseekJson(system, user, 1200);
+  return { selection: normalizeSelection(result, body.sentenceText || ""), usage: result.__usage };
 }
 
 async function quiz(body) {
@@ -197,9 +233,39 @@ function normalizeQuiz(value) {
   };
 }
 
+function normalizeSelection(value, sentenceText) {
+  const sentence = String(sentenceText || "");
+  let text = String(value.text || "").trim();
+  let startOffset = Number(value.startOffset);
+  let endOffset = Number(value.endOffset);
+  if ((!Number.isFinite(startOffset) || !Number.isFinite(endOffset) || endOffset <= startOffset) && text) {
+    const index = sentence.indexOf(text);
+    if (index >= 0) {
+      startOffset = index;
+      endOffset = index + text.length;
+    }
+  }
+  startOffset = clampNumber(startOffset, 0, sentence.length);
+  endOffset = clampNumber(endOffset, startOffset, sentence.length);
+  if (!text && endOffset > startOffset) text = sentence.slice(startOffset, endOffset);
+  return {
+    text,
+    startOffset,
+    endOffset,
+    kind: String(value.kind || "word"),
+    confidence: clampNumber(Number(value.confidence || 0), 0, 1),
+    reason: String(value.reason || ""),
+  };
+}
+
 function truncate(value, limit) {
   const text = String(value || "");
   return text.length > limit ? `${text.slice(0, limit)}\n...[truncated]` : text;
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
 }
 
 function applyCors(req, res) {
