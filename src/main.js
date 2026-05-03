@@ -161,7 +161,10 @@ function bindGlobalActions() {
       explainReaderSelection(target.dataset.mode || "analyze");
     }
     if (action === "ai-save-selection") {
-      saveReaderSelection();
+      saveReaderSelection(target.dataset.source || "selection");
+    }
+    if (action === "test-ai-connection") {
+      testAiConnection();
     }
     if (action === "generate-quiz") {
       generateQuiz(target.dataset.taskId);
@@ -195,7 +198,9 @@ function bindGlobalActions() {
     }
   });
 
-  document.addEventListener("mouseup", handleTextSelection);
+  document.addEventListener("mouseup", () => window.setTimeout(handleTextSelection, 0));
+  document.addEventListener("keyup", () => window.setTimeout(handleTextSelection, 0));
+  document.addEventListener("touchend", () => window.setTimeout(handleTextSelection, 80));
 }
 
 async function getPdfJs() {
@@ -366,7 +371,8 @@ function render() {
 }
 
 function navButton(view, label) {
-  return `<button class="${app.view === view ? "active" : ""}" data-action="nav" data-view="${view}">${label}</button>`;
+  const notebookCount = view === "notebook" ? (app.state.aiNotebook || []).filter((item) => !item.archived).length : 0;
+  return `<button class="${app.view === view ? "active" : ""}" data-action="nav" data-view="${view}">${label}${notebookCount ? ` (${notebookCount})` : ""}</button>`;
 }
 
 function renderView(plan) {
@@ -860,14 +866,31 @@ function renderReader() {
 function renderReaderAiPanel() {
   const meta = app.state.pdfIndexMeta;
   const result = app.aiPanel.result;
+  const selection = app.readerSelection;
   return `
-    <div class="ai-reader-box">
+    <div class="ai-reader-box" id="readerAiPanel">
       <div class="task-items" style="margin-top:0;">
         <span class="pill ${meta?.fingerprint ? "level" : "warn"}">${meta?.fingerprint ? "索引已建" : "索引未建"}</span>
         <span class="pill">代理 ${app.state.settings.ai.proxyUrl}</span>
       </div>
       <p class="task-meta" id="pdfIndexStatus">${meta?.indexedAt ? `索引时间：${formatDateTime(meta.indexedAt)}` : "首次打开阅读器会在后台建立本机索引。"}</p>
-      <button class="small" data-action="build-pdf-index">重建索引</button>
+      <div class="mini-toolbar">
+        <button class="small" data-action="build-pdf-index">重建索引</button>
+        <button class="small" data-action="test-ai-connection">测试 AI 连接</button>
+      </div>
+      <div class="selection-card ${selection?.text ? "active" : ""}">
+        <span class="pill ${selection?.text ? "level" : "warn"}">当前选中</span>
+        ${selection?.text ? `
+          <blockquote>${escapeHtml(selection.text)}</blockquote>
+          <p class="task-meta">第 ${selection.page} 页${selection.entryRef ? ` · ${escapeHtml(selection.entryRef)}` : ""}</p>
+          <div class="mini-toolbar">
+            <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
+            <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
+            <button class="small" data-action="ai-save-selection" data-source="selection">收藏选中内容</button>
+            ${result ? `<button class="small" data-action="ai-save-selection" data-source="explanation">收藏 AI 解释</button>` : ""}
+          </div>
+        ` : `<p>在 PDF 中选中一个词、短语或例句，这里会出现解释和收藏按钮。</p>`}
+      </div>
       ${app.aiPanel.status === "loading" ? `<div class="empty" style="margin-top:12px;">AI 正在分析选中文本...</div>` : ""}
       ${app.aiPanel.message ? `<div class="empty" style="margin-top:12px;">${escapeHtml(app.aiPanel.message)}</div>` : ""}
       ${result ? renderAiExplanation(result) : ""}
@@ -875,8 +898,15 @@ function renderReaderAiPanel() {
   `;
 }
 
+function renderReaderSidePanel() {
+  const panel = document.querySelector("#readerAiPanel");
+  if (panel) panel.outerHTML = renderReaderAiPanel();
+}
+
 function renderAiExplanation(result) {
   const grammar = result.grammarPoints || [];
+  const breakdown = result.sentenceBreakdown || [];
+  const examples = result.examples || [];
   return `
     <div class="ai-result">
       <div class="task-title">
@@ -885,8 +915,28 @@ function renderAiExplanation(result) {
       </div>
       <p>${escapeHtml(result.meaning || "")}</p>
       ${result.reading ? `<p class="task-meta">读音：${escapeHtml(result.reading)}</p>` : ""}
-      ${grammar.length ? `<div class="task-items">${grammar.map((item) => `<span class="pill">${escapeHtml(item.level || "语法")} ${escapeHtml(item.name || "")}</span>`).join("")}</div>` : ""}
+      ${result.partOfSpeech ? `<p class="task-meta">词性/表达：${escapeHtml(result.partOfSpeech)}</p>` : ""}
+      ${grammar.length ? `
+        <div class="ai-section">
+          <h5>语法点</h5>
+          ${grammar.map((item) => `
+            <div class="ai-line">
+              <span class="pill">${escapeHtml(item.level || "语法")} ${escapeHtml(item.name || "")}</span>
+              <p>${escapeHtml(item.explanation || "")}</p>
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+      ${breakdown.length ? `
+        <div class="ai-section">
+          <h5>句子拆解</h5>
+          ${breakdown.map((item) => `<p><strong>${escapeHtml(item.text || "")}</strong>：${escapeHtml(item.role || "")} ${escapeHtml(item.meaning || "")}</p>`).join("")}
+        </div>
+      ` : ""}
+      ${result.confusion?.length ? `<div class="ai-section"><h5>易混点</h5>${result.confusion.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div>` : ""}
+      ${examples.length ? `<div class="ai-section"><h5>例句</h5>${examples.map((item) => `<p>${escapeHtml(item.ja || "")}<br /><span>${escapeHtml(item.zh || "")}</span></p>`).join("")}</div>` : ""}
       ${result.reviewSuggestion ? `<p class="task-meta">${escapeHtml(result.reviewSuggestion)}</p>` : ""}
+      ${result.uncertainty ? `<p class="quiz-feedback bad">${escapeHtml(result.uncertainty)}</p>` : ""}
     </div>
   `;
 }
@@ -1022,28 +1072,39 @@ function openReader(page, title) {
   render();
 }
 
-function handleTextSelection(event) {
-  const layer = event.target.closest?.("#textLayer");
-  if (!layer) return;
+function handleTextSelection() {
+  if (app.view !== "reader") return;
+  const shell = document.querySelector(".reader-shell");
+  const layer = document.querySelector("#textLayer");
+  if (!shell || !layer) return;
   const selection = window.getSelection();
   const text = selection ? selection.toString().trim() : "";
-  if (!text) return;
+  if (!selection || selection.rangeCount === 0 || !text) return;
+  const anchorNode = selection.anchorNode?.nodeType === Node.TEXT_NODE ? selection.anchorNode.parentElement : selection.anchorNode;
+  const focusNode = selection.focusNode?.nodeType === Node.TEXT_NODE ? selection.focusNode.parentElement : selection.focusNode;
+  if (!shell.contains(anchorNode) && !shell.contains(focusNode)) return;
+  if (!layer.contains(anchorNode) && !layer.contains(focusNode)) return;
   const rect = selection.getRangeAt(0).getBoundingClientRect();
+  const wrapRect = layer.getBoundingClientRect();
+  const currentEntry = currentEntryForPage(app.readerPage);
   app.readerSelection = {
     text,
     page: app.readerPage,
-    entryRef: currentEntryForPage(app.readerPage)?.id || "",
+    entryRef: currentEntry?.id || "",
+    selectedAt: new Date().toISOString(),
   };
   const tools = document.querySelector("#selectionTools");
-  if (!tools) return;
-  tools.hidden = false;
-  tools.style.left = `${Math.max(12, rect.left + window.scrollX - layer.getBoundingClientRect().left)}px`;
-  tools.style.top = `${Math.max(12, rect.top + window.scrollY - layer.getBoundingClientRect().top - 46)}px`;
-  tools.innerHTML = `
-    <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
-    <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
-    <button class="small" data-action="ai-save-selection">收藏</button>
-  `;
+  if (tools) {
+    tools.hidden = false;
+    tools.style.left = `${clampNumber(rect.left - wrapRect.left, 12, Math.max(12, wrapRect.width - 260))}px`;
+    tools.style.top = `${clampNumber(rect.top - wrapRect.top - 46, 12, Math.max(12, wrapRect.height - 54))}px`;
+    tools.innerHTML = `
+      <button class="small primary" data-action="ai-explain-selection" data-mode="word">解释词句</button>
+      <button class="small" data-action="ai-explain-selection" data-mode="grammar">识别语法</button>
+      <button class="small" data-action="ai-save-selection" data-source="selection">收藏</button>
+    `;
+  }
+  renderReaderSidePanel();
 }
 
 async function explainReaderSelection(mode) {
@@ -1062,9 +1123,9 @@ async function explainReaderSelection(mode) {
   }
 }
 
-async function saveReaderSelection() {
+async function saveReaderSelection(source = "selection") {
   if (!app.readerSelection?.text) return;
-  const result = app.aiPanel.result || {};
+  const result = source === "explanation" ? (app.aiPanel.result || {}) : {};
   const item = {
     id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     type: guessNotebookType(app.readerSelection.text, result),
@@ -1081,9 +1142,35 @@ async function saveReaderSelection() {
     reviewSuggestion: result.reviewSuggestion || "",
   };
   app.state.aiNotebook.unshift(item);
-  app.aiPanel.message = "已收藏，明天开始进入 AI 生词/例句复习。";
+  app.aiPanel.message = `已收藏「${item.text.slice(0, 24)}${item.text.length > 24 ? "..." : ""}」，明天开始进入 AI 生词/例句复习。`;
   saveState();
   render();
+}
+
+async function testAiConnection() {
+  app.aiPanel = { status: "loading", message: "正在测试 AI 代理连接...", result: app.aiPanel.result };
+  renderReaderSidePanel();
+  try {
+    const base = (app.state.settings.ai?.proxyUrl || AI_PROXY_DEFAULT).replace(/\/$/, "");
+    const health = await fetch(`${base}/api/health`).then((response) => response.json());
+    if (!health.hasKey) {
+      app.aiPanel = { status: "error", message: "AI 代理已启动，但没有读取到 DeepSeek API Key。", result: app.aiPanel.result };
+      renderReaderSidePanel();
+      return;
+    }
+    await aiFetch("/api/deepseek/explain", {
+      mode: "word",
+      selectedText: "日本語",
+      currentEntry: null,
+      entryContext: "接続テスト用の短い文脈です。",
+      pageText: "",
+      nearbyContext: "",
+    });
+    app.aiPanel = { status: "done", message: "AI 连接正常，可以解释和生成小测。", result: app.aiPanel.result };
+  } catch (error) {
+    app.aiPanel = { status: "error", message: `AI 连接失败：${error.message}`, result: app.aiPanel.result };
+  }
+  renderReaderSidePanel();
 }
 
 function guessNotebookType(text, result) {

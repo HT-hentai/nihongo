@@ -601,6 +601,70 @@ select:focus {
   background: rgba(255, 255, 255, 0.025);
 }
 
+.mini-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.selection-card {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px dashed var(--b2);
+  border-radius: var(--r-sm);
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.selection-card.active {
+  border-style: solid;
+  border-color: rgba(0, 209, 168, 0.24);
+  background: rgba(0, 209, 168, 0.045);
+}
+
+.selection-card blockquote {
+  margin-top: 10px;
+  padding-left: 10px;
+  border-left: 3px solid var(--teal);
+  color: var(--t1);
+  font-size: 13.5px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.selection-card p {
+  margin-top: 8px;
+  color: var(--t2);
+  font-size: 13px;
+}
+
+.ai-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--b1);
+}
+
+.ai-section h5 {
+  margin-bottom: 8px;
+  color: var(--t3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.ai-section p,
+.ai-line p {
+  margin-top: 6px;
+  color: var(--t2);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.ai-section strong {
+  color: var(--t1);
+}
+
 .quiz-question {
   padding: 10px 0;
   border-top: 1px solid var(--b1);
