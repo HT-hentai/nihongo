@@ -24,6 +24,8 @@ npm run serve:static
 npm run check
 ```
 
+也可以单独运行本地代理和配置回归测试：`npm test`。
+
 启动后可以在应用的「用户中心」选择 DeepSeek 或 MiniMax 并粘贴 API Key；卡片展开后会后台预缓存当前例句，单击日文词语优先直接显示句中解释，双击例句会分析整句。
 
 也可以用环境变量启动：`DEEPSEEK_API_KEY="your_api_key_here" node server.mjs` 或 `MINIMAX_API_KEY="your_api_key_here" node server.mjs`。默认服务商是 DeepSeek，默认模型 `deepseek-v4-flash`，请求会显式关闭思考模式；MiniMax 默认模型是 `MiniMax-M2.7-highspeed`。可用 `AI_PROVIDER`、`DEEPSEEK_MODEL`、`MINIMAX_MODEL` 覆盖。AI 请求只发送句型名、日文例句、分词索引和后文窗口，不发送原书中文说明；预缓存会让 AI 一次返回整句拆解和各 token 的句中作用，AI 解释要求输出简体中文。
