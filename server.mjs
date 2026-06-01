@@ -12,6 +12,7 @@ import {
 
 const ROOT = fileURLToPath(new URL(".", import.meta.url));
 const PORT = Number(process.env.PORT || 5173);
+const AI_REQUEST_TIMEOUT_MS = Number(process.env.AI_REQUEST_TIMEOUT_MS || 45000);
 const DEFAULT_AI_PROVIDER = process.env.AI_PROVIDER || CONFIG_DEFAULT_AI_PROVIDER;
 const PROVIDER_CONFIG = {
   deepseek: {
@@ -216,14 +217,14 @@ async function requestAiProvider({ provider, apiKey, baseUrl, body }) {
   for (const url of urls) {
     let apiResponse;
     try {
-      apiResponse = await fetch(url, {
+      apiResponse = await fetchWithTimeout(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(body),
-      });
+      }, AI_REQUEST_TIMEOUT_MS);
     } catch (error) {
       return providerNetworkError(provider, url, error);
     }
@@ -260,8 +261,18 @@ function completionUrlsFor(provider, baseUrl) {
 
   const urls = [`${value}/chat/completions`];
   const isMiniMaxHost = /^https?:\/\/api\.minimax(i)?\.com\b/i.test(value);
-  if (isMiniMaxHost) urls.push(`${value}/text/chatcompletion_v2`);
+  if (provider === "minimax" || isMiniMaxHost) urls.push(`${value}/text/chatcompletion_v2`);
   return urls;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function normalizeProvider(provider) {
@@ -305,6 +316,7 @@ async function readApiPayload(response) {
 
 function providerNetworkError(provider, url, error) {
   const endpoint = safeEndpointLabel(url);
+  const isTimeout = error?.name === "AbortError" || /timed out|abort/i.test(error?.message || "");
   return {
     ok: false,
     httpStatus: 502,
@@ -312,7 +324,9 @@ function providerNetworkError(provider, url, error) {
     provider,
     status: 502,
     endpoint,
-    error: `${providerLabel(provider)} 网络请求失败（${endpoint}）：${error.message || "无法连接服务商"}`,
+    error: isTimeout
+      ? `${providerLabel(provider)} 请求超时（${endpoint}）。`
+      : `${providerLabel(provider)} 网络请求失败（${endpoint}）：${error.message || "无法连接服务商"}`,
     advice: adviceForAiError("network_error", provider, endpoint),
   };
 }
@@ -356,7 +370,7 @@ function adviceForAiError(code, provider, endpoint = null) {
     rate_limited: `${label} 返回限流。请稍后重试，或临时切换服务商/模型。`,
     provider_unavailable: `${label} 服务暂时不可用。请稍后重试，或切换服务商。${endpointHint}`,
     endpoint_not_found: `${endpointHint}请检查 Base URL 是否正确；MiniMax 可在用户中心切换“国际接口 / 中国区接口 / 原生接口”。`,
-    network_error: `${label} 网络连接失败。请检查本机网络、代理设置和 Base URL；AI 功能必须通过 node server.mjs 同源访问。`,
+    network_error: `${label} 网络连接失败或请求超时。请检查本机网络、代理设置和 Base URL；AI 功能必须通过 node server.mjs 同源访问。`,
     invalid_model_json: "模型没有按要求输出 JSON。请点击“重新分析”；如果反复出现，换用默认快速模型后再试。",
   }[code] || "请稍后重试；如果问题持续，请检查 API Key、模型名和 Base URL。";
 }
@@ -412,6 +426,7 @@ function serveStatic(request, response) {
 
   response.writeHead(200, {
     "Content-Type": MIME_TYPES[extname(filePath)] || "application/octet-stream",
+    "Cache-Control": "no-store",
   });
   if (request.method === "HEAD") {
     response.end();

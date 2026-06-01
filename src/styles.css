@@ -741,10 +741,23 @@ select:focus {
 
 .jp-token {
   display: inline-flex;
+  align-items: flex-end;
   margin: 1px 1px;
   padding: 1px 3px;
   border-radius: 4px;
   cursor: pointer;
+}
+
+.jp-ruby {
+  ruby-position: over;
+}
+
+.jp-ruby rt {
+  color: var(--t3);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0;
+  user-select: none;
 }
 
 .jp-token:hover,
@@ -778,6 +791,25 @@ select:focus {
   font-size: 11px;
   line-height: 1.4;
   pointer-events: none;
+}
+
+.content-alert,
+.ai-status-row {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--b1);
+  border-radius: var(--r-sm);
+  background: var(--s2);
+}
+
+.content-alert p,
+.ai-status-row p {
+  margin: 0;
+  color: var(--t3);
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 
 .ai-panel {

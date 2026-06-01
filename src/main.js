@@ -4,14 +4,45 @@ import {
   providerDefaults,
   providerLabel as configuredProviderLabel,
 } from "./ai-config.mjs";
+import {
+  analyzeEntryText,
+  grammarContentBlocks,
+  normalizeExtractedText,
+} from "./grammar-content.mjs";
+import {
+  catalogFromOutline,
+  cleanupTitle,
+} from "./pdf-catalog.mjs";
+import {
+  addDays,
+  clampDate,
+  clampNumber,
+  dateIndex,
+  dateRange,
+  daysUntil,
+  formatDate,
+  formatShortDate,
+  range,
+  todayIso,
+  toIsoDate,
+} from "./date-utils.mjs";
+import {
+  DEFAULT_DAILY_MINUTES,
+  END_DATE,
+  EXAM_DATE,
+  LEVEL_ORDER,
+  START_DATE,
+  allPlanLevelsForProfile,
+  defaultStudyProfile,
+  diagnosticLevelsForProfile,
+  levelIndex,
+  mainLevelsForProfile,
+  normalizeStudyProfile,
+} from "./study-profile.mjs";
 
 const STORAGE_KEY = "bluebook-n2-agent-state-v1";
 const SECRET_STORAGE_KEY = "bluebook-n2-agent-secrets-v1";
 const STATE_VERSION = 4;
-const START_DATE = "2026-05-01";
-const END_DATE = "2026-07-04";
-const EXAM_DATE = "2026-07-05";
-const LEVEL_ORDER = ["N5", "N4", "N3", "N2", "N1"];
 const REVIEW_INTERVALS = [1, 3, 7, 14, 30];
 const CONTENT_SAVE_INTERVAL = 6;
 const MINIMAX_DEFAULT_MODEL = AI_PROVIDERS.minimax.defaultModel;
@@ -19,10 +50,8 @@ const MINIMAX_DEFAULT_BASE_URL = AI_PROVIDERS.minimax.defaultBaseUrl;
 const DEEPSEEK_DEFAULT_MODEL = AI_PROVIDERS.deepseek.defaultModel;
 const DEEPSEEK_DEFAULT_BASE_URL = AI_PROVIDERS.deepseek.defaultBaseUrl;
 const AI_PROMPT_VERSION = "grammar-ai-v2";
+const CONTENT_PARSER_VERSION = "grammar-content-v3";
 const AI_PRECACHE_EXAMPLE_LIMIT = 2;
-const DEFAULT_CURRENT_LEVEL = "N4";
-const DEFAULT_TARGET_LEVEL = "N2";
-const DEFAULT_DAILY_MINUTES = 240;
 const PAST_PAPER_YEARS = {
   N5: range(2010, 2024),
   N4: range(2010, 2024),
@@ -62,6 +91,8 @@ let app = {
   selectedExampleIndex: null,
   selectedGrammarTarget: null,
   aiLoadingRef: null,
+  aiPrecacheStatus: {},
+  secretDrafts: {},
   aiMessage: "",
   onboardingMessage: "",
   userCenterMessage: "",
@@ -109,14 +140,7 @@ function defaultState() {
 }
 
 function defaultOnboarding() {
-  return {
-    currentLevel: DEFAULT_CURRENT_LEVEL,
-    targetLevel: DEFAULT_TARGET_LEVEL,
-    dailyMinutes: DEFAULT_DAILY_MINUTES,
-    examDate: EXAM_DATE,
-    startDate: todayIso(),
-    completedAt: null,
-  };
+  return defaultStudyProfile();
 }
 
 function loadState() {
@@ -225,31 +249,7 @@ function normalizeSavedState(saved) {
 }
 
 function normalizeOnboarding(onboarding, saved = {}) {
-  const base = defaultOnboarding();
-  const existingStudy = Boolean(
-    saved.version
-    || (saved.catalog && saved.catalog.length)
-    || Object.keys(saved.statuses || {}).length
-    || Object.keys(saved.grammarProgress || {}).length
-  );
-  const candidate = {
-    ...base,
-    ...(onboarding || {}),
-  };
-  candidate.currentLevel = LEVEL_ORDER.includes(candidate.currentLevel) ? candidate.currentLevel : DEFAULT_CURRENT_LEVEL;
-  candidate.targetLevel = LEVEL_ORDER.includes(candidate.targetLevel) ? candidate.targetLevel : DEFAULT_TARGET_LEVEL;
-  if (levelIndex(candidate.targetLevel) < levelIndex(candidate.currentLevel)) {
-    candidate.targetLevel = candidate.currentLevel;
-  }
-  candidate.dailyMinutes = clampNumber(candidate.dailyMinutes, 45, 480);
-  candidate.examDate = candidate.examDate || EXAM_DATE;
-  candidate.startDate = candidate.startDate || todayIso();
-  if (!candidate.completedAt && existingStudy && !onboarding) {
-    candidate.startDate = START_DATE;
-    candidate.completedAt = new Date().toISOString();
-    candidate.migratedFromLegacy = true;
-  }
-  return candidate;
+  return normalizeStudyProfile(onboarding, saved);
 }
 
 function isOnboardingComplete() {
@@ -258,28 +258,6 @@ function isOnboardingComplete() {
 
 function studyProfile() {
   return normalizeOnboarding(app.state.onboarding || defaultOnboarding(), { onboarding: app.state.onboarding });
-}
-
-function levelIndex(level) {
-  const index = LEVEL_ORDER.indexOf(level);
-  return index === -1 ? LEVEL_ORDER.indexOf(DEFAULT_TARGET_LEVEL) : index;
-}
-
-function diagnosticLevelsForProfile(profile = studyProfile()) {
-  const targetIndex = levelIndex(profile.targetLevel);
-  const currentIndex = Math.min(levelIndex(profile.currentLevel), targetIndex);
-  return LEVEL_ORDER.slice(0, currentIndex + 1).filter((level) => levelIndex(level) <= targetIndex);
-}
-
-function mainLevelsForProfile(profile = studyProfile()) {
-  const targetIndex = levelIndex(profile.targetLevel);
-  const currentIndex = Math.min(levelIndex(profile.currentLevel), targetIndex);
-  const levels = LEVEL_ORDER.slice(currentIndex + 1, targetIndex + 1);
-  return levels.length ? levels : [profile.targetLevel];
-}
-
-function allPlanLevelsForProfile(profile = studyProfile()) {
-  return uniqueRefs([...diagnosticLevelsForProfile(profile), ...mainLevelsForProfile(profile)]);
 }
 
 function updateOnboardingField(field, value, shouldRender = true) {
@@ -317,9 +295,14 @@ function saveOnboarding() {
   app.selectedDate = clampDate(todayIso(), app.state.onboarding.startDate, planEndDateForProfile(app.state.onboarding));
   app.view = "today";
   app.onboardingMessage = "";
+  const shouldScanCatalog = !app.state.catalog.length || hasMissingPlanCatalogLevels(app.state.onboarding);
   saveState();
   render();
-  if (!app.state.catalog.length) scanCatalogFromPdf(true);
+  if (shouldScanCatalog) {
+    scanCatalogFromPdf(true);
+  } else if (hasMissingGrammarContent()) {
+    ensureGrammarContent(false);
+  }
 }
 
 function migrateLegacyGrammarProgress(state, saved) {
@@ -406,10 +389,20 @@ function isoDateFromTimestamp(value) {
 }
 
 function bindGlobalActions() {
+  document.addEventListener("submit", (event) => {
+    if (event.target.matches("[data-ai-settings-form]")) {
+      event.preventDefault();
+      saveUserSettings(event.target);
+    }
+  });
+
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");
     if (!target) return;
     const action = target.dataset.action;
+    if (action === "save-user-settings" || action === "test-ai-settings") {
+      captureActiveSecretField();
+    }
     if (action === "nav") {
       app.view = target.dataset.view;
       render();
@@ -502,7 +495,7 @@ function bindGlobalActions() {
       resetProgress();
     }
     if (action === "save-user-settings") {
-      saveUserSettings();
+      saveUserSettings(document.querySelector("[data-ai-settings-form]"));
     }
     if (action === "clear-api-key") {
       clearApiKey();
@@ -557,12 +550,15 @@ function bindGlobalActions() {
     if (target.matches("[data-reader-page]")) {
       openReader(Number(target.value || 1), app.readerTitle);
     }
+    if (target.matches("[data-secret-field]")) {
+      captureSecretFieldDraft(target);
+    }
   });
 
   document.addEventListener("input", (event) => {
     const target = event.target;
     if (target.matches("[data-secret-field]")) {
-      updateCurrentAiConfig(target.dataset.secretField, target.value);
+      captureSecretFieldDraft(target);
     }
     if (target.matches("[data-onboarding-field]")) {
       updateOnboardingField(target.dataset.onboardingField, target.value, false);
@@ -576,6 +572,18 @@ function bindGlobalActions() {
         input.focus();
         input.setSelectionRange(cursor, cursor);
       }
+    }
+  });
+
+  document.addEventListener("keyup", (event) => {
+    if (event.target.matches("[data-secret-field]")) {
+      captureSecretFieldDraft(event.target);
+    }
+  });
+
+  document.addEventListener("paste", (event) => {
+    if (event.target.matches("[data-secret-field]")) {
+      window.setTimeout(() => captureSecretFieldDraft(event.target), 0);
     }
   });
 
@@ -631,78 +639,6 @@ async function scanCatalogFromPdf(isAuto) {
   }
 }
 
-async function catalogFromOutline(outline, pdf) {
-  const flat = [];
-  function walk(items, depth = 0, level = null) {
-    for (const item of items) {
-      const title = item.title || "";
-      const nextLevel = /N[1-5]文法/.test(title) ? title.match(/N[1-5]/)[0] : level;
-      flat.push({ item, title, depth, level: nextLevel });
-      if (item.items && item.items.length) {
-        walk(item.items, depth + 1, nextLevel);
-      }
-    }
-  }
-  walk(outline);
-
-  const entries = [];
-  for (const node of flat) {
-    if (!LEVEL_ORDER.includes(node.level)) continue;
-    const parsed = parseEntryTitle(node.title);
-    if (!parsed) continue;
-    const page = await pageFromDestination(pdf, node.item.dest);
-    entries.push({
-      id: `${node.level}-${parsed.number}`,
-      level: node.level,
-      number: parsed.number,
-      title: parsed.title || `第 ${parsed.number} 条`,
-      page,
-      pdfTarget: page ? `page=${page}` : "",
-      videoRef: "",
-    });
-  }
-  return uniqueEntries(entries).sort((a, b) => LEVEL_ORDER.indexOf(a.level) - LEVEL_ORDER.indexOf(b.level) || a.number - b.number);
-}
-
-function parseEntryTitle(title) {
-  if (/^\s*第\s*\d+\s*单元/.test(title)) return null;
-  const match = title.match(/^\s*(?:第\s*)?(\d{1,3})[.．、]?\s*(.+)$/);
-  if (!match) return null;
-  return {
-    number: Number(match[1]),
-    title: cleanupTitle(match[2]),
-  };
-}
-
-function cleanupTitle(title) {
-  return title
-    .replace(/\s+/g, " ")
-    .replace(/[｜\u0000-\u001f]/g, "")
-    .trim();
-}
-
-async function pageFromDestination(pdf, dest) {
-  if (!dest) return null;
-  try {
-    const explicitDest = Array.isArray(dest) ? dest : await pdf.getDestination(dest);
-    if (!explicitDest || !explicitDest[0]) return null;
-    const pageIndex = await pdf.getPageIndex(explicitDest[0]);
-    return pageIndex + 1;
-  } catch (error) {
-    return null;
-  }
-}
-
-function uniqueEntries(entries) {
-  const seen = new Set();
-  return entries.filter((entry) => {
-    const key = `${entry.level}-${entry.number}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function countLevel(entries, level) {
   return entries.filter((entry) => entry.level === level).length;
 }
@@ -711,6 +647,12 @@ function hasMissingCatalogLevels() {
   if (!app.state.catalog.length) return true;
   const existing = new Set(app.state.catalog.map((entry) => entry.level));
   return LEVEL_ORDER.some((level) => !existing.has(level));
+}
+
+function hasMissingPlanCatalogLevels(profile = studyProfile()) {
+  if (!app.state.catalog.length) return true;
+  const existing = new Set(app.state.catalog.map((entry) => entry.level));
+  return allPlanLevelsForProfile(profile).some((level) => !existing.has(level));
 }
 
 function render() {
@@ -925,7 +867,7 @@ function renderToday(plan) {
 
 function renderGrammarOverview(date, plan) {
   const summary = grammarSummaryForDate(date, plan);
-  const rows = summary.studyQueue.length ? summary.studyQueue : plannedGrammarEntriesForDate(date, plan).map((entry) => ({
+  const rows = summary.studyQueue.length ? summary.studyQueue : plannedOverviewGrammarEntriesForDate(date, plan).map((entry) => ({
     entry,
     ref: entryRef(entry),
     reason: "已安排",
@@ -942,6 +884,7 @@ function renderGrammarOverview(date, plan) {
           </div>
           <div class="task-meta">先从这里进入学习或复习页；首页只做今日内容总览，不直接展开抽认卡。</div>
           <div class="grammar-overview-stats">
+            ${stat("查漏", `${summary.diagnosticCount}`)}
             ${stat("新学", `${summary.newCount}`)}
             ${stat("补学", `${summary.learningCount}`)}
             ${stat("复习", `${summary.reviewCount}`)}
@@ -967,7 +910,7 @@ function renderGrammarMiniRow(item) {
   return `
     <div class="grammar-mini-row">
       <div>
-        <span class="pill ${item.queueKind === "review" ? "warn" : item.queueKind === "learning" ? "bad" : "level"}">${item.reason}</span>
+        <span class="pill ${grammarQueuePillClass(item.queueKind)}">${item.reason}</span>
         <span class="pill">${entry.level} ${entry.number}</span>
         <span>${escapeHtml(entry.title)}</span>
       </div>
@@ -1081,7 +1024,7 @@ function stat(label, value) {
 }
 
 function renderDayOutline(queue, date, plan) {
-  const planned = plannedGrammarEntriesForDate(date, plan);
+  const planned = plannedOverviewGrammarEntriesForDate(date, plan);
   if (!queue.length && !planned.length) return `<div class="empty">今天没有蓝宝书文法新条目。</div>`;
   const rows = queue.length ? queue : planned.map((entry) => ({
     entry,
@@ -1095,7 +1038,7 @@ function renderDayOutline(queue, date, plan) {
     .map((item) => `
       <div class="outline-entry">
         <div class="task-items" style="margin: 0 0 8px;">
-          <span class="pill ${item.queueKind === "review" ? "warn" : item.queueKind === "learning" ? "bad" : "level"}">${item.reason}</span>
+          <span class="pill ${grammarQueuePillClass(item.queueKind)}">${item.reason}</span>
           <span class="pill">${item.entry.level} ${item.entry.number}</span>
         </div>
         <button class="link-button" data-action="open-grammar-card" data-entry-ref="${item.ref}" data-view="search">${escapeHtml(item.entry.title)}</button>
@@ -1199,7 +1142,7 @@ function renderCalendar(plan) {
 
 function renderCalendarDay(date, plan) {
   const tasks = tasksForDate(date, plan);
-  const grammar = plannedGrammarEntriesForDate(date, plan);
+  const grammar = plannedOverviewGrammarEntriesForDate(date, plan);
   const grammarDue = grammarQueueForDate(date, plan).length;
   const rolloverCount = tasks.filter((task) => task.rolloverReason).length;
   const total = tasks.length;
@@ -1211,6 +1154,13 @@ function renderCalendarDay(date, plan) {
       <p>${grammar.length ? entryRangeLabel(grammar) : phaseLabel(date, plan)}</p>
     </button>
   `;
+}
+
+function grammarQueuePillClass(queueKind) {
+  if (queueKind === "review") return "warn";
+  if (queueKind === "learning") return "bad";
+  if (queueKind === "diagnostic") return "info";
+  return "level";
 }
 
 function renderReview(plan) {
@@ -1314,43 +1264,43 @@ function renderUserCenter() {
         <p>第一项：AI API 设置。Key 只保存在本机浏览器，不会进入进度导出。</p>
       </div>
       <div class="toolbar">
-        <button data-action="test-ai-settings">测试连接</button>
-        <button class="primary" data-action="save-user-settings">保存设置</button>
+        <button type="button" data-action="test-ai-settings">测试连接</button>
+        <button class="primary" type="submit" form="aiSettingsForm">保存设置</button>
       </div>
     </div>
-    <section class="panel">
+    <form class="panel" id="aiSettingsForm" data-ai-settings-form data-provider="${provider}">
       <div class="panel-head">
         <h3>AI API</h3>
         <p>粘贴 API Key 后，抽认卡会先预热例句；DeepSeek 默认使用非思考快速模式。</p>
       </div>
       <div class="panel-body">
         <div class="preset-grid">
-          <button class="small ${provider === "deepseek" ? "primary" : ""}" data-action="set-ai-provider" data-provider="deepseek">DeepSeek</button>
-          <button class="small ${provider === "minimax" ? "primary" : ""}" data-action="set-ai-provider" data-provider="minimax">MiniMax</button>
+          <button type="button" class="small ${provider === "deepseek" ? "primary" : ""}" data-action="set-ai-provider" data-provider="deepseek">DeepSeek</button>
+          <button type="button" class="small ${provider === "minimax" ? "primary" : ""}" data-action="set-ai-provider" data-provider="minimax">MiniMax</button>
         </div>
         <div class="settings-grid">
           <label class="setting-field">
             <span>API Key</span>
-            <input type="password" autocomplete="off" spellcheck="false" value="${escapeAttr(config.apiKey || "")}" placeholder="${provider === "deepseek" ? "sk-..." : "sk-api-..."}" data-secret-field="apiKey" />
+            <input id="aiApiKey" name="apiKey" type="password" autocomplete="off" spellcheck="false" value="${escapeAttr(config.apiKey || "")}" placeholder="${provider === "deepseek" ? "sk-..." : "sk-api-..."}" data-secret-field="apiKey" />
           </label>
           <label class="setting-field">
             <span>模型</span>
-            <input value="${escapeAttr(config.model || providerDefaultModel(provider))}" data-secret-field="model" />
+            <input id="aiModel" name="model" value="${escapeAttr(config.model || providerDefaultModel(provider))}" data-secret-field="model" />
           </label>
           <label class="setting-field">
             <span>API Base URL</span>
-            <input value="${escapeAttr(baseUrl)}" data-secret-field="baseUrl" />
+            <input id="aiBaseUrl" name="baseUrl" value="${escapeAttr(baseUrl)}" data-secret-field="baseUrl" />
           </label>
         </div>
         ${renderAiProviderPresets(provider, baseUrl, config.model)}
         <div class="toolbar user-actions">
-          <button class="danger" data-action="clear-api-key" ${hasKey ? "" : "disabled"}>清除 API Key</button>
+          <button type="button" class="danger" data-action="clear-api-key" ${hasKey ? "" : "disabled"}>清除 API Key</button>
           <span class="pill ${hasKey ? "level" : "warn"}">${hasKey ? `${providerLabel(provider)} 已保存 ${maskApiKey(config.apiKey)}` : `${providerLabel(provider)} 未保存 API Key`}</span>
         </div>
         ${app.userCenterMessage ? `<div class="empty user-message">${escapeHtml(app.userCenterMessage)}</div>` : ""}
         <p class="source-note">安全提醒：这里是为了个人本地学习方便，Key 会存入当前浏览器的 localStorage。公共电脑请不要保存，或用完后清除。</p>
       </div>
-    </section>
+    </form>
     <section class="panel">
       <div class="panel-head">
         <h3>备考目标</h3>
@@ -1375,17 +1325,17 @@ function renderAiProviderPresets(provider, baseUrl, model) {
   if (provider === "deepseek") {
     return `
       <div class="preset-grid">
-        <button class="small ${baseUrl === DEEPSEEK_DEFAULT_BASE_URL ? "primary" : ""}" data-action="set-ai-base" data-base-url="${DEEPSEEK_DEFAULT_BASE_URL}">DeepSeek 官方</button>
-        <button class="small ${model === "deepseek-v4-flash" ? "primary" : ""}" data-action="set-ai-model" data-model="deepseek-v4-flash">v4 Flash</button>
-        <button class="small ${model === "deepseek-v4-pro" ? "primary" : ""}" data-action="set-ai-model" data-model="deepseek-v4-pro">v4 Pro</button>
+        <button type="button" class="small ${baseUrl === DEEPSEEK_DEFAULT_BASE_URL ? "primary" : ""}" data-action="set-ai-base" data-base-url="${DEEPSEEK_DEFAULT_BASE_URL}">DeepSeek 官方</button>
+        <button type="button" class="small ${model === "deepseek-v4-flash" ? "primary" : ""}" data-action="set-ai-model" data-model="deepseek-v4-flash">v4 Flash</button>
+        <button type="button" class="small ${model === "deepseek-v4-pro" ? "primary" : ""}" data-action="set-ai-model" data-model="deepseek-v4-pro">v4 Pro</button>
       </div>
     `;
   }
   return `
     <div class="preset-grid">
-      <button class="small ${baseUrl === "https://api.minimax.io/v1" ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimax.io/v1">国际接口</button>
-      <button class="small ${baseUrl === "https://api.minimaxi.com/v1" ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimaxi.com/v1">中国区接口</button>
-      <button class="small ${/chatcompletion_v2$/.test(baseUrl) ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimax.io/v1/text/chatcompletion_v2">原生接口</button>
+      <button type="button" class="small ${baseUrl === "https://api.minimax.io/v1" ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimax.io/v1">国际接口</button>
+      <button type="button" class="small ${baseUrl === "https://api.minimaxi.com/v1" ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimaxi.com/v1">中国区接口</button>
+      <button type="button" class="small ${/chatcompletion_v2$/.test(baseUrl) ? "primary" : ""}" data-action="set-ai-base" data-base-url="https://api.minimax.io/v1/text/chatcompletion_v2">原生接口</button>
     </div>
   `;
 }
@@ -1716,10 +1666,13 @@ async function extractEntryContent(pdf, entry, next) {
     texts.push(await extractPageText(page));
   }
   const raw = texts.join("\n\n");
+  const analysis = analyzeEntryText(raw, entry, next);
   return {
-    text: trimEntryText(raw, entry, next),
+    text: analysis.text,
     startPage,
     endPage,
+    rawLength: raw.length,
+    warnings: analysis.warnings,
     extractedAt: new Date().toISOString(),
     signature: contentSignatureForEntry(entry, next),
     source: "pdfjs-text-layer",
@@ -1733,6 +1686,8 @@ async function extractPageText(page) {
       text: cleanupTitle(item.str || ""),
       x: item.transform ? item.transform[4] : 0,
       y: item.transform ? item.transform[5] : 0,
+      width: item.width || 0,
+      height: item.height || 0,
     }))
     .filter((item) => item.text);
   items.sort((a, b) => Math.round(b.y) - Math.round(a.y) || a.x - b.x);
@@ -1748,40 +1703,102 @@ async function extractPageText(page) {
     }
   }
 
-  return normalizeExtractedText(lines
-    .map((line) => line.parts.sort((a, b) => a.x - b.x).map((part) => part.text).join(""))
-    .join("\n"));
+  return normalizeExtractedText(renderExtractedLinesWithRuby(lines).join("\n"));
 }
 
-function trimEntryText(text, entry, next) {
-  let value = normalizeExtractedText(text);
-  const start = findEntryMarker(value, entry);
-  if (start >= 0) {
-    value = value.slice(start);
+function renderExtractedLinesWithRuby(lines) {
+  const rendered = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = normalizeExtractedLine(lines[index]);
+    const next = lines[index + 1] ? normalizeExtractedLine(lines[index + 1]) : null;
+    if (next && isExtractedFuriganaLine(line, next)) {
+      rendered.push(annotateExtractedLineWithRuby(next, line));
+      index += 1;
+      continue;
+    }
+    rendered.push(extractedLineText(line));
   }
-  if (next) {
-    const searchOffset = Math.min(value.length, 20);
-    const nextIndex = findEntryMarker(value.slice(searchOffset), next);
-    if (nextIndex >= 0) {
-      value = value.slice(0, searchOffset + nextIndex);
+  return rendered;
+}
+
+function normalizeExtractedLine(line) {
+  return {
+    ...line,
+    parts: line.parts.slice().sort((a, b) => a.x - b.x),
+  };
+}
+
+function extractedLineText(line) {
+  return line.parts.map((part) => part.text).join("");
+}
+
+function isExtractedFuriganaLine(line, next) {
+  const text = extractedLineText(line);
+  const nextText = extractedLineText(next);
+  const yGap = line.y - next.y;
+  return yGap >= 6
+    && yGap <= 24
+    && /^[ぁ-んァ-ヶー]+$/.test(text)
+    && /[一-龯々〆〤0-9０-９]/.test(nextText);
+}
+
+function annotateExtractedLineWithRuby(baseLine, furiganaLine) {
+  const queues = baseLine.parts.map(() => []);
+  const candidates = baseLine.parts
+    .map((part, index) => ({ part, index }))
+    .filter(({ part }) => hasRubyBase(part.text));
+  for (const reading of furiganaLine.parts.filter((part) => part.text.trim())) {
+    const target = nearestRubyBasePart(reading, candidates);
+    if (target) queues[target.index].push(reading.text);
+  }
+  return baseLine.parts
+    .map((part, index) => annotateExtractedPartWithRuby(part.text, queues[index]))
+    .join("");
+}
+
+function nearestRubyBasePart(reading, candidates) {
+  if (!candidates.length) return null;
+  const center = reading.x + (reading.width || 0) / 2;
+  return candidates
+    .map((candidate) => {
+      const { part } = candidate;
+      const left = part.x - 2;
+      const right = part.x + (part.width || 0) + 2;
+      const partCenter = part.x + (part.width || 0) / 2;
+      const contains = center >= left && center <= right;
+      return { ...candidate, distance: contains ? 0 : Math.abs(center - partCenter) };
+    })
+    .sort((a, b) => a.distance - b.distance)[0];
+}
+
+function annotateExtractedPartWithRuby(text, readings) {
+  if (!readings.length || !hasRubyBase(text)) return text;
+  let result = "";
+  let cursor = 0;
+  let readingIndex = 0;
+  while (cursor < text.length) {
+    const char = text[cursor];
+    if (isRubyBaseChar(char) && readings[readingIndex]) {
+      let end = cursor + 1;
+      while (end < text.length && isRubyBaseChar(text[end])) end += 1;
+      const base = text.slice(cursor, end);
+      result += `[[ruby:${base}|${readings[readingIndex]}]]`;
+      readingIndex += 1;
+      cursor = end;
+    } else {
+      result += char;
+      cursor += 1;
     }
   }
-  return normalizeExtractedText(value);
+  return result;
 }
 
-function findEntryMarker(text, entry) {
-  const match = new RegExp(`(^|\\n)\\s*${entry.number}\\s*[.．、]\\s*`, "m").exec(text);
-  return match ? match.index + match[1].length : -1;
+function hasRubyBase(text) {
+  return /[一-龯々〆〤0-9０-９]/.test(text);
 }
 
-function normalizeExtractedText(text) {
-  return String(text || "")
-    .replace(/\r/g, "")
-    .split("\n")
-    .map((line) => line.trim())
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+function isRubyBaseChar(char) {
+  return /[一-龯々〆〤0-9０-９]/.test(char);
 }
 
 function nextGrammarEntry(entries, index) {
@@ -1794,7 +1811,7 @@ function nextGrammarEntry(entries, index) {
 }
 
 function contentSignatureForEntry(entry, next) {
-  return `${entryRef(entry)}|${entry.page || ""}|${entry.title || ""}|${next ? `${entryRef(next)}:${next.page || ""}` : "end"}`;
+  return `${CONTENT_PARSER_VERSION}|${entryRef(entry)}|${entry.page || ""}|${entry.title || ""}|${next ? `${entryRef(next)}:${next.page || ""}` : "end"}`;
 }
 
 function buildPlan(catalog, profile = defaultOnboarding()) {
@@ -1805,6 +1822,7 @@ function buildPlan(catalog, profile = defaultOnboarding()) {
   const phaseDates = splitPhaseDates(dates, normalizedProfile, catalog);
   const phaseByDate = phaseMapFromDates(phaseDates, normalizedProfile);
   const chunksByDate = {};
+  const diagnosticChunksByDate = buildDiagnosticGrammarChunksByDate(catalog, normalizedProfile, phaseDates.diagnostic);
   for (const level of mainLevelsForProfile(normalizedProfile)) {
     const entries = catalog.filter((entry) => entry.level === level).sort((a, b) => a.number - b.number);
     const chunks = chunkEntries(entries, phaseDates[level].length);
@@ -1815,7 +1833,36 @@ function buildPlan(catalog, profile = defaultOnboarding()) {
       }
     });
   }
-  return { dates, phaseDates, phaseByDate, chunksByDate, profile: normalizedProfile };
+  return { dates, phaseDates, phaseByDate, chunksByDate, diagnosticChunksByDate, profile: normalizedProfile };
+}
+
+function buildDiagnosticGrammarChunksByDate(catalog, profile, dates = []) {
+  const entries = diagnosticGrammarEntries(catalog, profile);
+  const limit = diagnosticGrammarDailyLimit(profile);
+  const chunksByDate = {};
+  dates.forEach((date, index) => {
+    const chunk = entries.slice(index * limit, (index + 1) * limit);
+    if (chunk.length) chunksByDate[date] = chunk;
+  });
+  return chunksByDate;
+}
+
+function diagnosticGrammarEntries(catalog, profile) {
+  const levels = diagnosticLevelsForProfile(profile)
+    .slice()
+    .sort((a, b) => levelIndex(b) - levelIndex(a));
+  return levels.flatMap((level) => catalog
+    .filter((entry) => entry.level === level)
+    .slice()
+    .sort((a, b) => a.number - b.number));
+}
+
+function diagnosticGrammarDailyLimit(profile) {
+  const minutes = Number(profile.dailyMinutes) || DEFAULT_DAILY_MINUTES;
+  if (minutes < 90) return 3;
+  if (minutes < 150) return 5;
+  if (minutes < 240) return 8;
+  return 12;
 }
 
 function splitPhaseDates(dates, profile, catalog = []) {
@@ -2051,6 +2098,17 @@ function plannedGrammarEntriesForDate(date, plan) {
   return (plan.chunksByDate[date] || []).flatMap((chunk) => chunk.entries);
 }
 
+function plannedDiagnosticGrammarEntriesForDate(date, plan) {
+  return plan.diagnosticChunksByDate?.[date] || [];
+}
+
+function plannedOverviewGrammarEntriesForDate(date, plan) {
+  return [
+    ...plannedDiagnosticGrammarEntriesForDate(date, plan),
+    ...plannedGrammarEntriesForDate(date, plan),
+  ];
+}
+
 function orderedGrammarEntries() {
   return (app.state.catalog || [])
     .filter((entry) => LEVEL_ORDER.includes(entry.level))
@@ -2072,27 +2130,40 @@ function grammarQueueForDate(date, plan) {
     queue.push({ entry, ref, reason, queueKind, dueDate, baseDate, progress });
   }
 
-  for (const entry of plannedGrammarEntriesForDate(date, plan)) {
-    const ref = entryRef(entry);
-    const progress = grammarProgressFor(ref);
-    if (progress.status === "mastered") continue;
-    if (progress.status === "review" && progress.dueDate && progress.dueDate > date) continue;
+  function addPlannedEntry(entry, plannedKind, plannedReason, baseDate) {
+    const progress = grammarProgressFor(entryRef(entry));
+    if (progress.status === "mastered") return;
+    if (progress.status === "review" && progress.dueDate && progress.dueDate > date) return;
     if (progress.status === "review" && (!progress.dueDate || progress.dueDate <= date)) {
-      add(entry, "到期复习", "review", progress.dueDate, date);
-      continue;
+      add(entry, "到期复习", "review", progress.dueDate, baseDate);
+      return;
     }
     if (progress.status === "learning" && (!progress.dueDate || progress.dueDate <= date)) {
-      add(entry, "重新学习", "learning", progress.dueDate, date);
-      continue;
+      add(entry, "重新学习", "learning", progress.dueDate, baseDate);
+      return;
     }
     if (progress.status === "new") {
-      add(entry, "新学", "new", null, date);
+      add(entry, plannedReason, plannedKind, null, baseDate);
     }
+  }
+
+  for (const entry of plannedDiagnosticGrammarEntriesForDate(date, plan)) {
+    addPlannedEntry(entry, "diagnostic", "查漏", date);
+  }
+
+  for (const entry of plannedGrammarEntriesForDate(date, plan)) {
+    addPlannedEntry(entry, "new", "新学", date);
   }
 
   if (date >= today) {
     const firstDate = plan.dates?.[0] || START_DATE;
     for (const sourceDate of dateRange(firstDate, addDays(date, -1))) {
+      for (const entry of plannedDiagnosticGrammarEntriesForDate(sourceDate, plan)) {
+        const progress = grammarProgressFor(entryRef(entry));
+        if (progress.status === "new") {
+          add(entry, "逾期查漏", "learning", date, sourceDate);
+        }
+      }
       for (const entry of plannedGrammarEntriesForDate(sourceDate, plan)) {
         const progress = grammarProgressFor(entryRef(entry));
         if (progress.status === "new") {
@@ -2126,6 +2197,7 @@ function grammarSummaryForDate(date, plan) {
   return {
     studyQueue: grammarLearningQueueForDate(date, plan),
     reviewQueue,
+    diagnosticCount: queue.filter((item) => item.queueKind === "diagnostic").length,
     newCount: queue.filter((item) => item.queueKind === "new").length,
     learningCount: queue.filter((item) => item.queueKind === "learning").length,
     reviewCount: reviewQueue.length,
@@ -2134,7 +2206,7 @@ function grammarSummaryForDate(date, plan) {
 }
 
 function compareGrammarQueueItems(a, b) {
-  const priority = { learning: 1, review: 2, new: 3, planned: 4, search: 5 };
+  const priority = { learning: 1, review: 2, diagnostic: 3, new: 4, planned: 5, search: 6 };
   return (priority[a.queueKind] || 9) - (priority[b.queueKind] || 9)
     || (a.dueDate || a.baseDate || "").localeCompare(b.dueDate || b.baseDate || "")
     || LEVEL_ORDER.indexOf(a.entry.level) - LEVEL_ORDER.indexOf(b.entry.level)
@@ -2159,9 +2231,7 @@ function renderGrammarCard(item, options = {}) {
   const progress = grammarProgressFor(ref);
   const content = app.state.grammarContent[ref];
   const hasContent = content && content.text && content.text.trim();
-  const sourceLabel = hasContent
-    ? `PDF 原文 ${content.startPage || entry.page || "-"}-${content.endPage || entry.page || "-"} 页`
-    : "尚未提取到正文，可打开 PDF 对照";
+  const sourceLabel = grammarContentSourceLabel(content, entry, hasContent);
   const answer = app.flashcardAnswerVisible;
   const mode = options.mode || "detail";
   return `
@@ -2186,6 +2256,7 @@ function renderGrammarCard(item, options = {}) {
         ${answer
           ? `
             <div class="grammar-text">${hasContent ? formatGrammarContent(content.text, ref) : "还没有提取到这一条的正文。中文说明不会接入 AI；可先打开 PDF 原文查看。"}</div>
+            ${renderGrammarContentStatus(content)}
             ${hasContent ? renderAiPanel(ref) : ""}
           `
           : `<button class="primary" data-action="toggle-answer">显示答案</button>`}
@@ -2197,6 +2268,40 @@ function renderGrammarCard(item, options = {}) {
       </div>
     </article>
   `;
+}
+
+function grammarContentSourceLabel(content, entry, hasContent) {
+  if (hasContent) {
+    const warningCount = Array.isArray(content.warnings) ? content.warnings.length : 0;
+    return `PDF 原文 ${content.startPage || entry.page || "-"}-${content.endPage || entry.page || "-"} 页${warningCount ? ` · 提取提示 ${warningCount} 条` : ""}`;
+  }
+  if (content?.error) return "PDF 文本提取异常，可打开 PDF 对照";
+  if (content) return "PDF 文本层未提取到正文，可打开 PDF 对照";
+  return "尚未提取到正文，可打开 PDF 对照";
+}
+
+function renderGrammarContentStatus(content) {
+  if (!content) return "";
+  const warnings = Array.isArray(content.warnings) ? content.warnings : [];
+  const messages = [
+    content.error ? `提取异常：${content.error}` : "",
+    ...warnings.map(grammarContentWarningLabel),
+  ].filter(Boolean);
+  if (!messages.length) return "";
+  return `
+    <div class="content-alert">
+      <span class="pill warn">PDF 提取提示</span>
+      ${messages.map((message) => `<p>${escapeHtml(message)}</p>`).join("")}
+    </div>
+  `;
+}
+
+function grammarContentWarningLabel(code) {
+  return {
+    start_marker_missing: "没有精确定位当前条目标题，显示内容可能从页首开始。",
+    next_marker_missing: "没有定位到下一条起点，已按 PDF 页码范围截断。",
+    empty_text: "PDF 文本层没有提取到这一条正文。",
+  }[code] || `提取提示：${code}`;
 }
 
 function grammarActionButtons(ref, progress = grammarProgressFor(ref), mode = "detail") {
@@ -2246,6 +2351,7 @@ function renderAiPanel(ref) {
   const cached = app.state.aiExplanations[aiCacheKey(ref)] || aiResultFromSentencePrecache(ref, target);
   const isLoading = app.aiLoadingRef === ref;
   const isPreheating = !target && hasPrecacheInFlightForRef(ref);
+  const panelStatus = aiPanelStatus(ref, target, cached, isLoading, isPreheating);
   const targetLabel = target
     ? target.type === "word"
       ? `已选词语：${target.text}`
@@ -2266,11 +2372,68 @@ function renderAiPanel(ref) {
         </div>
         ${target ? `<button class="small" data-action="refresh-ai-explanation" data-entry-ref="${ref}">重新分析</button>` : ""}
       </div>
+      <div class="ai-status-row">
+        <span class="pill ${panelStatus.tone}">${escapeHtml(panelStatus.label)}</span>
+        <p>${escapeHtml(panelStatus.message)}</p>
+      </div>
       ${isLoading ? `<div class="empty">正在分析：${escapeHtml(targetLabel)}...</div>` : ""}
       ${app.aiMessage && app.selectedGrammarTarget?.ref === ref ? `<div class="empty">${escapeHtml(app.aiMessage)}</div>` : ""}
       ${cached ? renderAiExplanation(cached, entry) : `<div class="ai-placeholder">${placeholder}</div>`}
     </div>
   `;
+}
+
+function aiPanelStatus(ref, target, cached, isLoading, isPreheating) {
+  const precache = app.aiPrecacheStatus[ref];
+  if (cached) {
+    return {
+      tone: "level",
+      label: cached.fromPrecache ? "句子缓存" : "已缓存",
+      message: cached.fromPrecache
+        ? "已命中例句预分析缓存，当前解释没有再次请求服务商。"
+        : "已命中本机 AI 缓存；点击重新分析会刷新当前选择。",
+    };
+  }
+  if (isLoading) {
+    return {
+      tone: "info",
+      label: "分析中",
+      message: app.aiMessage || "正在请求 AI；如果句子预分析失败，会自动改用单次分析。",
+    };
+  }
+  if (!hasConfiguredAi()) {
+    return {
+      tone: "warn",
+      label: "未配置",
+      message: "未保存 API Key。可以先阅读 PDF 原文；AI 拆解需要在用户中心配置 Key 或设置环境变量。",
+    };
+  }
+  if (precache?.status === "error") {
+    return {
+      tone: "bad",
+      label: "预热失败",
+      message: precache.message || "例句预热失败。选择词语后会尝试单次分析，也可以点击重新分析。",
+    };
+  }
+  if (isPreheating || precache?.status === "loading") {
+    return {
+      tone: "info",
+      label: "预热中",
+      message: precache?.message || "正在后台预热当前例句，完成后单击词语会优先使用缓存。",
+    };
+  }
+  if (target) {
+    return {
+      tone: "info",
+      label: "待分析",
+      message: "已选择例句片段；如果没有可用句子缓存，会请求 AI 做单次分析。",
+    };
+  }
+  return {
+    tone: "info",
+    label: "待选择",
+    message: "单击日文词语查看句中作用；双击例句查看整句拆解。",
+  };
 }
 
 function renderAiExplanation(result, entry) {
@@ -2441,7 +2604,8 @@ function normalizeSearch(value) {
   return String(value || "").trim().toLocaleLowerCase();
 }
 
-function saveUserSettings() {
+function saveUserSettings(form = document.querySelector("[data-ai-settings-form]")) {
+  syncCurrentAiConfigFromForm(form);
   const provider = currentAiProvider();
   const config = currentAiConfig();
   updateCurrentAiConfig("apiKey", String(config.apiKey || "").trim());
@@ -2456,29 +2620,97 @@ function saveUserSettings() {
 }
 
 function clearApiKey() {
-  updateCurrentAiConfig("apiKey", "");
-  saveSecrets();
-  app.userCenterMessage = `${providerLabel(currentAiProvider())} API Key 已从本机浏览器清除。`;
+  app.secrets = normalizeSecrets(app.secrets);
+  const provider = app.secrets.provider;
+  app.secrets.providers[provider] = {
+    ...(app.secrets.providers[provider] || {}),
+    apiKey: "",
+  };
+  setSecretDraftValue(provider, "apiKey", "");
+  localStorage.setItem(SECRET_STORAGE_KEY, JSON.stringify(app.secrets));
+  app.userCenterMessage = `${providerLabel(provider)} API Key 已从本机浏览器清除。`;
   render();
 }
 
 function setAiProvider(provider) {
   if (!["minimax", "deepseek"].includes(provider)) return;
+  syncCurrentAiConfigFromForm();
   app.secrets = normalizeSecrets({ ...app.secrets, provider });
   app.userCenterMessage = `已切换到 ${providerLabel(provider)}。`;
   render();
 }
 
 function setAiBaseUrl(baseUrl) {
+  syncCurrentAiConfigFromForm();
   updateCurrentAiConfig("baseUrl", baseUrl || providerDefaultBaseUrl(currentAiProvider()));
   app.userCenterMessage = `已切换 Base URL：${currentAiConfig().baseUrl}`;
   render();
 }
 
 function setAiModel(model) {
+  syncCurrentAiConfigFromForm();
   updateCurrentAiConfig("model", model || providerDefaultModel(currentAiProvider()));
   app.userCenterMessage = `已切换模型：${currentAiConfig().model}`;
   render();
+}
+
+function syncCurrentAiConfigFromForm(form = document.querySelector("[data-ai-settings-form]")) {
+  captureActiveSecretField();
+  const provider = currentAiProvider();
+  const draft = app.secretDrafts[provider] || {};
+  const config = currentAiConfig();
+  const fields = {
+    apiKey: form?.elements?.apiKey || form?.querySelector?.('[data-secret-field="apiKey"]') || document.querySelector('[data-ai-settings-form] [data-secret-field="apiKey"]'),
+    model: form?.elements?.model || form?.querySelector?.('[data-secret-field="model"]') || document.querySelector('[data-ai-settings-form] [data-secret-field="model"]'),
+    baseUrl: form?.elements?.baseUrl || form?.querySelector?.('[data-secret-field="baseUrl"]') || document.querySelector('[data-ai-settings-form] [data-secret-field="baseUrl"]'),
+  };
+  const next = {
+    apiKey: fieldValueOrDraft(fields.apiKey, draft.apiKey, config.apiKey || ""),
+    model: fieldValueOrDraft(fields.model, draft.model, config.model || providerDefaultModel(provider)),
+    baseUrl: fieldValueOrDraft(fields.baseUrl, draft.baseUrl, config.baseUrl || providerDefaultBaseUrl(provider)),
+  };
+  app.secrets = normalizeSecrets({
+    ...app.secrets,
+    providers: {
+      ...app.secrets.providers,
+      [provider]: {
+        ...config,
+        apiKey: next.apiKey,
+        model: next.model,
+        baseUrl: next.baseUrl,
+      },
+    },
+  });
+}
+
+function fieldValueOrDraft(field, draftValue, fallback) {
+  const value = field ? String(field.value || "").trim() : "";
+  if (value) return value;
+  if (typeof draftValue === "string") return draftValue.trim();
+  return String(fallback || "").trim();
+}
+
+function captureActiveSecretField() {
+  const active = document.activeElement;
+  if (active?.matches?.("[data-secret-field]")) {
+    captureSecretFieldDraft(active);
+  }
+}
+
+function captureSecretFieldDraft(field) {
+  const name = field?.dataset?.secretField;
+  if (!name) return;
+  const provider = currentAiProvider();
+  const value = String(field.value || "");
+  setSecretDraftValue(provider, name, value);
+  updateCurrentAiConfig(name, value);
+}
+
+function setSecretDraftValue(provider, field, value) {
+  app.secretDrafts[provider] = {
+    ...(app.secretDrafts[provider] || {}),
+    [field]: value,
+  };
 }
 
 function updateCurrentAiConfig(field, value) {
@@ -2514,6 +2746,7 @@ function providerLabel(provider) {
 }
 
 async function testAiSettings() {
+  syncCurrentAiConfigFromForm();
   const provider = currentAiProvider();
   const config = currentAiConfig();
   if (!String(config.apiKey || "").trim()) {
@@ -2667,12 +2900,35 @@ async function prefetchGrammarExampleAnalysis(ref, exampleIndex, options = {}) {
   if (!key || !hasConfiguredAi()) return null;
   if (options.force) {
     delete app.state.aiExplanations[key];
+    delete app.aiPrecacheStatus[ref];
   }
   if (app.state.aiExplanations[key]) return app.state.aiExplanations[key];
   if (!options.force && aiPrecacheInFlight.has(key)) return aiPrecacheInFlight.get(key);
 
   let promise;
+  app.aiPrecacheStatus[ref] = {
+    status: "loading",
+    message: `正在预热例句 ${Number(exampleIndex) + 1}。`,
+    updatedAt: new Date().toISOString(),
+  };
   promise = fetchGrammarExamplePrecache(ref, exampleIndex, options)
+    .then((result) => {
+      app.aiPrecacheStatus[ref] = {
+        status: "done",
+        message: `例句 ${Number(exampleIndex) + 1} 已预热完成。`,
+        updatedAt: new Date().toISOString(),
+      };
+      return result;
+    })
+    .catch((error) => {
+      app.aiPrecacheStatus[ref] = {
+        status: "error",
+        message: formatAiException(error, "例句预热失败。"),
+        updatedAt: new Date().toISOString(),
+      };
+      if (options.renderOnComplete && app.selectedGrammarRef === ref) render();
+      throw error;
+    })
     .finally(() => {
       if (aiPrecacheInFlight.get(key) !== promise) return;
       aiPrecacheInFlight.delete(key);
@@ -2930,6 +3186,7 @@ function refreshGrammarAi(ref) {
   delete app.state.aiExplanations[aiCacheKey(ref)];
   const sentenceKey = aiSentenceCacheKey(ref, target.exampleIndex);
   if (sentenceKey) delete app.state.aiExplanations[sentenceKey];
+  delete app.aiPrecacheStatus[ref];
   saveState();
   requestGrammarAi(ref, { forceSentence: true });
 }
@@ -2985,6 +3242,8 @@ async function requestGrammarAi(ref, options = {}) {
       await prefetchGrammarExampleAnalysis(ref, target.exampleIndex, { force: options.forceSentence });
     } catch (precacheError) {
       console.warn("Grammar sentence precache failed, falling back to focused analysis", precacheError);
+      app.aiMessage = "例句预分析失败，正在改用单次分析。";
+      render();
     }
     const precomputed = aiResultFromSentencePrecache(ref, target);
     if (precomputed) {
@@ -3608,78 +3867,6 @@ function progressSummary(plan) {
   return { total, done };
 }
 
-function dateRange(start, end) {
-  const dates = [];
-  let current = start;
-  while (current <= end) {
-    dates.push(current);
-    current = addDays(current, 1);
-  }
-  return dates;
-}
-
-function range(start, end) {
-  return Array.from({ length: end - start + 1 }, (_, index) => start + index);
-}
-
-function addDays(date, delta) {
-  const value = parseIsoDate(date);
-  value.setDate(value.getDate() + delta);
-  return toIsoDate(value);
-}
-
-function parseIsoDate(date) {
-  const [year, month, day] = date.split("-").map(Number);
-  return new Date(year, month - 1, day);
-}
-
-function toIsoDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function todayIso() {
-  return toIsoDate(new Date());
-}
-
-function clampDate(date, min, max) {
-  if (date < min) return min;
-  if (date > max) return max;
-  return date;
-}
-
-function clampNumber(value, min, max) {
-  return Math.min(max, Math.max(min, Number(value) || min));
-}
-
-function dateIndex(date) {
-  return Math.round((parseIsoDate(date) - parseIsoDate(START_DATE)) / 86400000);
-}
-
-function daysUntil(target, from) {
-  return Math.max(0, Math.round((parseIsoDate(target) - parseIsoDate(from)) / 86400000));
-}
-
-function formatDate(date) {
-  const value = parseIsoDate(date);
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "long",
-    day: "numeric",
-    weekday: "short",
-  }).format(value);
-}
-
-function formatShortDate(date) {
-  const value = parseIsoDate(date);
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "numeric",
-    day: "numeric",
-    weekday: "short",
-  }).format(value);
-}
-
 function formatGrammarContent(text, ref) {
   const blocks = grammarContentBlocks(text);
   if (!blocks.length) return "";
@@ -3693,7 +3880,7 @@ function formatGrammarContent(text, ref) {
       return `
         <div class="grammar-example ${isSentenceSelected ? "selected sentence-selected" : ""}" data-entry-ref="${ref}" data-example-index="${block.exampleIndex}">
           <span class="example-mark">例句 ${block.exampleIndex + 1}</span>
-          <span class="example-japanese">${formatSelectableJapanese(block.japanese, ref, block.exampleIndex)}</span>
+          <span class="example-japanese">${formatSelectableJapanese(block.japanese, ref, block.exampleIndex, block.rubySpans)}</span>
           ${block.source ? `<span class="example-source">${escapeHtml(block.source)}</span>` : ""}
           ${block.translation ? `<span class="example-translation">${escapeHtml(block.translation)}</span>` : ""}
         </div>
@@ -3701,40 +3888,6 @@ function formatGrammarContent(text, ref) {
     }
     return `<p>${escapeHtml(block.text)}</p>`;
   }).join("");
-}
-
-function grammarContentBlocks(text) {
-  const lines = normalizeExtractedText(text)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const blocks = [];
-  let exampleIndex = 0;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const next = lines[index + 1] || "";
-    if (isFuriganaPrelude(line, next)) continue;
-    if (isGrammarSectionHeading(line)) {
-      blocks.push({ type: "heading", text: line });
-      continue;
-    }
-    if (/^△/.test(line)) {
-      const exampleLines = [line.replace(/^△\s*/, "")];
-      while (index + 1 < lines.length && !isGrammarSectionHeading(lines[index + 1]) && !/^△/.test(lines[index + 1]) && !looksEntryMarker(lines[index + 1])) {
-        index += 1;
-        exampleLines.push(lines[index]);
-      }
-      const example = splitGrammarExample(exampleLines.join(""));
-      blocks.push({ type: "example", exampleIndex, ...example });
-      exampleIndex += 1;
-      continue;
-    }
-    if (!isLikelyNoiseLine(line)) {
-      blocks.push({ type: "paragraph", text: line });
-    }
-  }
-  return mergeParagraphBlocks(blocks);
 }
 
 function grammarContentExamples(ref) {
@@ -3749,7 +3902,7 @@ function grammarContentExamples(ref) {
     }));
 }
 
-function formatSelectableJapanese(text, ref, exampleIndex) {
+function formatSelectableJapanese(text, ref, exampleIndex, rubySpans = []) {
   const relatedIndexes = relatedTokenIndexesForSelection(ref, exampleIndex);
   return tokenizeJapaneseText(text)
     .map((token, tokenIndex) => {
@@ -3758,9 +3911,54 @@ function formatSelectableJapanese(text, ref, exampleIndex) {
       const selected = selectedGrammarTargetForRef(ref);
       const isSelected = selected?.type === "word" && selected.exampleIndex === exampleIndex && selected.tokenIndex === tokenIndex;
       const isRelated = relatedIndexes.has(tokenIndex);
-      return `<span class="jp-token ${isSelected ? "selected" : ""} ${isRelated ? "related" : ""}" data-action="select-grammar-example" data-entry-ref="${ref}" data-example-index="${exampleIndex}" data-token-index="${tokenIndex}" data-token-text="${escapeAttr(token.text)}">${escapeHtml(token.text)}</span>`;
+      return `<span class="jp-token ${isSelected ? "selected" : ""} ${isRelated ? "related" : ""}" data-action="select-grammar-example" data-entry-ref="${ref}" data-example-index="${exampleIndex}" data-token-index="${tokenIndex}" data-token-text="${escapeAttr(token.text)}">${formatRubyToken(token, rubySpans)}</span>`;
     })
     .join("");
+}
+
+function formatRubyToken(token, rubySpans = []) {
+  if (!Number.isInteger(token.start) || !rubySpans.length) return escapeHtml(token.text);
+  const tokenStart = token.start;
+  const tokenEnd = token.end;
+  const spans = rubySpans
+    .filter((span) => span.start < tokenEnd && span.end > tokenStart)
+    .map((span) => ({
+      ...span,
+      start: Math.max(span.start, tokenStart),
+      end: Math.min(span.end, tokenEnd),
+    }))
+    .sort((a, b) => a.start - b.start);
+  if (!spans.length) return escapeHtml(token.text);
+  if (canMergeRubyToken(token, tokenStart, tokenEnd, spans)) {
+    return `<ruby class="jp-ruby">${escapeHtml(token.text)}<rt>${escapeHtml(spans.map((span) => span.reading).join(""))}</rt></ruby>`;
+  }
+
+  let result = "";
+  let cursor = tokenStart;
+  for (const span of spans) {
+    const start = span.start;
+    const end = span.end;
+    if (start > cursor) {
+      result += escapeHtml(token.text.slice(cursor - tokenStart, start - tokenStart));
+    }
+    const base = token.text.slice(start - tokenStart, end - tokenStart);
+    result += `<ruby class="jp-ruby">${escapeHtml(base)}<rt>${escapeHtml(span.reading)}</rt></ruby>`;
+    cursor = end;
+  }
+  if (cursor < tokenEnd) {
+    result += escapeHtml(token.text.slice(cursor - tokenStart));
+  }
+  return result;
+}
+
+function canMergeRubyToken(token, tokenStart, tokenEnd, spans) {
+  if (!token.text || !Array.from(token.text).every(isRubyBaseChar)) return false;
+  let cursor = tokenStart;
+  for (const span of spans) {
+    if (span.start !== cursor || span.end <= span.start || span.end > tokenEnd) return false;
+    cursor = span.end;
+  }
+  return cursor === tokenEnd;
 }
 
 function tokenizeJapaneseText(text) {
@@ -3769,11 +3967,19 @@ function tokenizeJapaneseText(text) {
     const segmenter = new Intl.Segmenter("ja", { granularity: "word" });
     return Array.from(segmenter.segment(value)).map((segment) => ({
       text: segment.segment,
+      start: segment.index,
+      end: segment.index + segment.segment.length,
       isPunctuation: isPunctuationToken(segment.segment),
     }));
   }
-  return (value.match(/[一-龯々〆〤]+|[ぁ-んー]+|[ァ-ヶー]+|[A-Za-z0-9]+|[^\s]/g) || [])
-    .map((text) => ({ text, isPunctuation: isPunctuationToken(text) }));
+  const matches = value.matchAll(/[一-龯々〆〤]+|[ぁ-んー]+|[ァ-ヶー]+|[A-Za-z0-9０-９]+|[^\s]/g);
+  return Array.from(matches)
+    .map((match) => ({
+      text: match[0],
+      start: match.index,
+      end: match.index + match[0].length,
+      isPunctuation: isPunctuationToken(match[0]),
+    }));
 }
 
 function grammarTokenContext(tokens, tokenIndex) {
@@ -3800,66 +4006,6 @@ function isPunctuationToken(text) {
 
 function selectedGrammarTargetForRef(ref) {
   return app.selectedGrammarTarget?.ref === ref ? app.selectedGrammarTarget : null;
-}
-
-function splitGrammarExample(text) {
-  const value = normalizeInlineText(text);
-  const slashIndex = value.indexOf("/");
-  const japanese = stripExampleSource(slashIndex >= 0 ? value.slice(0, slashIndex) : value);
-  const translation = slashIndex >= 0 ? value.slice(slashIndex + 1) : "";
-  return {
-    japanese: normalizeInlineText(japanese.text),
-    translation: normalizeInlineText(translation),
-    source: japanese.source,
-  };
-}
-
-function stripExampleSource(text) {
-  let value = normalizeInlineText(text);
-  let source = "";
-  const sourcePattern = /\s*([【\[\(（［]\s*(?:19|20)\d{2}\s*年?\s*真\s*[题題]\s*[】\]\)）］])\s*$/u;
-  const match = value.match(sourcePattern);
-  if (match) {
-    source = normalizeInlineText(match[1]);
-    value = normalizeInlineText(value.slice(0, match.index));
-  }
-  return { text: value, source };
-}
-
-function isGrammarSectionHeading(line) {
-  return /^(接续|说明|例文|注意)\d*$/.test(line);
-}
-
-function looksEntryMarker(line) {
-  return /^\d{1,3}\.\s*～/.test(line);
-}
-
-function isFuriganaPrelude(line, next) {
-  return /^△/.test(next) && !/[。！？/「」『』【】]/.test(line) && /[ぁ-んァ-ヶ]/.test(line);
-}
-
-function isLikelyNoiseLine(line) {
-  return /^[\f\s]+$/.test(line);
-}
-
-function mergeParagraphBlocks(blocks) {
-  const result = [];
-  for (const block of blocks) {
-    const last = result[result.length - 1];
-    if (block.type === "paragraph" && last?.type === "paragraph") {
-      last.text = normalizeInlineText(`${last.text}${block.text}`);
-    } else {
-      result.push({ ...block });
-    }
-  }
-  return result;
-}
-
-function normalizeInlineText(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .replace(/\s+([。！？、，；：])/g, "$1")
-    .trim();
 }
 
 function aiCacheKey(ref) {

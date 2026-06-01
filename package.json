@@ -1,9 +1,12 @@
 {
   "type": "module",
   "scripts": {
-    "check": "node --check src/main.js && node --check src/ai-config.mjs && node --check server.mjs && npm test",
+    "check": "node --check src/main.js && node --check src/ai-config.mjs && node --check src/date-utils.mjs && node --check src/grammar-content.mjs && node --check src/pdf-catalog.mjs && node --check src/study-profile.mjs && node --check server.mjs && npm test",
     "serve": "node server.mjs",
     "serve:static": "python3 -m http.server 5173",
     "test": "node --test"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.60.0"
   }
 }

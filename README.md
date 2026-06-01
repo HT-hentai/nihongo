@@ -24,7 +24,14 @@ npm run serve:static
 npm run check
 ```
 
-也可以单独运行本地代理和配置回归测试：`npm test`。
+也可以单独运行回归测试：`npm test`。当前测试会覆盖：
+
+- 服务端健康检查、静态页面和 AI 结构化错误。
+- DeepSeek / MiniMax mock provider、超时、限流、404 fallback 和无效 JSON。
+- PDF 目录与正文质量：739 条目录、正文非空、N5 说明类无例句白名单和例句数量下限。
+- 本机 Chrome 前端 smoke：首次配置、扫描目录、提取全文、今日计划、文法卡片、AI 未配置/失败提示、进度导入导出。
+
+前端 smoke 使用 `playwright-core` 连接本机 Google Chrome，不会下载浏览器；如 Chrome 不在默认位置，可设置 `CHROME_PATH=/path/to/chrome` 后运行测试。
 
 启动后可以在应用的「用户中心」选择 DeepSeek 或 MiniMax 并粘贴 API Key；卡片展开后会后台预缓存当前例句，单击日文词语优先直接显示句中解释，双击例句会分析整句。
 
